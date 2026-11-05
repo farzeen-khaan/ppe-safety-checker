@@ -8,7 +8,7 @@ when it is ready, so a slow LLM never blocks the result. History is text only:
 the incident log stores no photos.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -18,15 +18,18 @@ import numpy as np
 from src.detect import load_model
 from src.pipeline import finish_analysis, inspect_image
 from src.report import Report
-from src.storage import get_analysis, list_analyses
+from src.storage import PKT, get_analysis, list_analyses
 from src.violations import MIN_PERSON_HEIGHT, PersonVerdict, summary_text
 
 MAX_UPLOAD_MB = 20
 HISTORY_LIMIT = 100
-# Pakistan has no daylight saving, so a fixed offset is exact (and needs no tzdata package).
-PKT = timezone(timedelta(hours=5), "PKT")
 
 VERDICT_HEADERS = ["Person", "Verdict", "Detection confidence"]
+# Shown after the status line. The alert is still sending when this appears; History shows the outcome.
+ALERT_NOTES = {
+    "sending": " Discord alert sending in the background (History shows when it is sent).",
+    "disabled": " Alerts are off, so no Discord alert was sent.",
+}
 HISTORY_HEADERS = ["ID", "Time (PKT)", "Image", "People", "OK", "Violations", "Too far", "Severity", "Report by", "Alert"]
 
 
@@ -118,6 +121,7 @@ def analyse(path: str | None):
         status = f"Analysed in {result.processing_ms / 1000:.1f} s, but **not saved** to the log: {result.save_error}"
     else:
         status = f"Analysed in {result.processing_ms / 1000:.1f} s. Saved as analysis #{result.analysis_id}."
+    status += ALERT_NOTES.get(result.alert_status, "")
     yield annotated, rows, summary, report_markdown(result.report), status
 
 

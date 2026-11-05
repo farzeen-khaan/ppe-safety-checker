@@ -197,6 +197,11 @@ def _ensure_db(path: Path | None) -> Path:
 
 # --- Time helpers ---
 
+# Times are stored in UTC and shown in Pakistan time. Pakistan has no daylight saving,
+# so a fixed offset is exact (and needs no tzdata package).
+PKT = timezone(timedelta(hours=5), "PKT")
+
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
