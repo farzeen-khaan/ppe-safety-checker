@@ -218,3 +218,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Dataset (623 MB, downloaded from Ultralytics; see README)
+data/
+
+# Local planning docs (not published)
+decisions.md
+flow.md
+PPE Safety Checker — PRD.md
+
+# Generated detection outputs
+outputs/
+
+# Local incident log (F5)
+db/

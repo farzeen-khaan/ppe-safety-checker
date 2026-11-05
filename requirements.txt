@@ -1,0 +1,22 @@
+# Detection (F1) — pulls in torch and torchvision
+ultralytics==8.4.202
+
+# Image handling (F3)
+opencv-python==5.0.0.93
+pillow==12.3.0
+numpy==2.5.4
+
+# Incident report (F4)
+google-genai==2.34.0
+
+# Web UI (F6)
+gradio==6.31.0
+
+# Telegram alerts and digest (F7, F8)
+requests==2.34.2
+
+# Config and secrets
+python-dotenv==1.2.4
+
+# Tests
+pytest==9.2.0
