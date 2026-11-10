@@ -232,3 +232,4 @@ outputs/
 
 # Local incident log (F5)
 db/
+*PRD*.md

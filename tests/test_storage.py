@@ -52,8 +52,42 @@ def test_init_is_idempotent_and_records_migrations(db):
     with storage.connect(db) as conn:
         versions = [r["version"] for r in conn.execute("SELECT version FROM schema_migrations")]
         tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    assert versions == [1]
-    assert {"analyses", "person_verdicts", "schema_migrations"} <= tables
+    assert versions == [1, 2]
+    assert {"analyses", "person_verdicts", "digest_runs", "schema_migrations"} <= tables
+
+
+def test_existing_version_1_log_is_upgraded(tmp_path, monkeypatch):
+    """A log created before Phase 7 gains digest_runs and keeps its analyses."""
+    path = tmp_path / "old.db"
+    monkeypatch.setattr(storage, "MIGRATIONS", storage.MIGRATIONS[:1])
+    storage.init_db(path)
+    old_id = save(path)
+    monkeypatch.undo()
+    storage._initialised.clear()
+    storage.init_db(path)
+    with storage.connect(path) as conn:
+        assert [r["version"] for r in conn.execute("SELECT version FROM schema_migrations")] == [1, 2]
+    assert storage.get_analysis(old_id, path=path) is not None
+    assert storage.list_digest_runs(path=path) == []
+
+
+def test_record_digest_run(db):
+    storage.record_digest_run(window_start=T0 - timedelta(hours=24), window_end=T0, status="sent",
+                              analyses_count=4, path=db)
+    storage.record_digest_run(window_start=T0, window_end=T0 + timedelta(hours=24), status="failed",
+                              error="HTTP 404: Unknown Webhook", path=db)
+    newest, oldest = storage.list_digest_runs(path=db)
+    assert (newest["status"], newest["analyses_count"], newest["error"]) == ("failed", None, "HTTP 404: Unknown Webhook")
+    assert (oldest["window_start"], oldest["window_end"], oldest["analyses_count"]) == (
+        "2026-11-04T13:00:00Z", "2026-11-05T13:00:00Z", 4
+    )
+
+
+@pytest.mark.parametrize("status, error", [("sent", "x"), ("failed", None), ("maybe", None)])
+def test_impossible_digest_runs_are_rejected(db, status, error):
+    with pytest.raises(sqlite3.IntegrityError):
+        storage.record_digest_run(window_start=T0 - timedelta(hours=1), window_end=T0, status=status,
+                                  error=error, path=db)
 
 
 def test_wal_mode_is_on(db):

@@ -9,6 +9,7 @@ changes one file. Design notes are in decisions.md; in short:
 - analyses:        one row per photo. Write-once, except the alert status.
                    Holds the counts too, so History and the digest read one table.
 - person_verdicts: one row per detected person, linked to its analysis.
+- digest_runs:     one row per daily digest run (F8): window, outcome, error.
 - schema_migrations: which numbered schema steps have been applied.
 
 CHECK constraints make the database reject impossible data (for example counts that
@@ -32,6 +33,7 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "db" / "incidents.db"
 SEVERITIES = ("High", "Medium", "None")
 REPORT_SOURCES = ("gemini", "template")
 ALERT_STATUSES = ("not_needed", "pending", "sent", "failed", "disabled")
+DIGEST_STATUSES = ("sent", "failed")
 
 # Numbered schema steps, applied in order and never edited once released.
 # To change the schema later, append a new step (2, 3, ...).
@@ -116,6 +118,29 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
                 CHECK ((has_helmet IS NULL) = (has_vest IS NULL)),  -- too far means both unknown
                 CHECK (confidence >= 0 AND confidence <= 1),
                 CHECK (x2 > x1 AND y2 > y1)
+            )
+            """,
+        ],
+    ),
+    (
+        2,
+        "Create digest_runs",
+        [
+            f"""
+            CREATE TABLE digest_runs (
+                id              INTEGER PRIMARY KEY,
+                ran_at          TEXT    NOT NULL,   -- UTC, when the run finished
+                window_start    TEXT    NOT NULL,   -- UTC, inclusive
+                window_end      TEXT    NOT NULL,   -- UTC, exclusive
+                analyses_count  INTEGER,            -- NULL if the log could not be read
+                status          TEXT    NOT NULL,
+                error           TEXT,               -- webhook URL already removed
+
+                CHECK (ran_at LIKE '____-__-__T__:__:__Z'),
+                CHECK (window_start < window_end),
+                CHECK (analyses_count IS NULL OR analyses_count >= 0),
+                CHECK (status IN {DIGEST_STATUSES}),
+                CHECK ((status = 'sent') = (error IS NULL))
             )
             """,
         ],
@@ -295,6 +320,24 @@ def update_alert_status(
             raise KeyError(f"no analysis with id {analysis_id}")
 
 
+def record_digest_run(
+    *,
+    window_start: datetime,
+    window_end: datetime,
+    status: str,
+    analyses_count: int | None = None,
+    error: str | None = None,
+    path: Path | None = None,
+) -> int:
+    """Record one digest run (F8). The caller removes the webhook URL from `error` first."""
+    with connect(_ensure_db(path)) as conn, transaction(conn):
+        return conn.execute(
+            "INSERT INTO digest_runs (ran_at, window_start, window_end, analyses_count, status, error)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (to_db_time(now_utc()), to_db_time(window_start), to_db_time(window_end), analyses_count, status, error),
+        ).lastrowid
+
+
 # --- Reads ---
 
 def list_analyses(limit: int = 50, offset: int = 0, path: Path | None = None) -> list[dict]:
@@ -329,6 +372,13 @@ def get_since(since: datetime, until: datetime | None = None, path: Path | None 
             "SELECT * FROM analyses WHERE created_at >= ? AND created_at < ? ORDER BY created_at, id",
             (to_db_time(since), to_db_time(until or now_utc() + timedelta(seconds=1))),
         ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_digest_runs(limit: int = 20, path: Path | None = None) -> list[dict]:
+    """Digest runs, newest first."""
+    with connect(_ensure_db(path)) as conn:
+        rows = conn.execute("SELECT * FROM digest_runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
 
 

@@ -154,8 +154,11 @@ def gemini_models() -> list[str]:
     return [preferred, *DEFAULT_MODELS] if preferred else list(DEFAULT_MODELS)
 
 
-def ask_gemini(payload: dict, model: str) -> LLMReport:
-    """Send the facts to one Gemini model and return its structured answer. Raises on any failure."""
+def ask_gemini(payload: dict, model: str, prompt: str = PROMPT, schema: type[BaseModel] = LLMReport) -> BaseModel:
+    """Send the facts to one Gemini model and return its structured answer. Raises on any failure.
+
+    prompt (with a {facts} placeholder) and schema default to the incident report; the digest passes its own.
+    """
     from google import genai  # imported here so the rest of the module works without it
     from google.genai import types
 
@@ -166,10 +169,10 @@ def ask_gemini(payload: dict, model: str) -> LLMReport:
     client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=LLM_TIMEOUT_MS))
     response = client.models.generate_content(
         model=model,
-        contents=PROMPT.format(facts=json.dumps(payload, indent=2)),
+        contents=prompt.format(facts=json.dumps(payload, indent=2)),
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=LLMReport,
+            response_schema=schema,
             temperature=0.2,  # low randomness: reports should read consistently
         ),
     )
@@ -178,7 +181,7 @@ def ask_gemini(payload: dict, model: str) -> LLMReport:
     return response.parsed
 
 
-def ask_llm(payload: dict) -> tuple[LLMReport, str]:
+def ask_llm(payload: dict, prompt: str = PROMPT, schema: type[BaseModel] = LLMReport) -> tuple[BaseModel, str]:
     """The single place that picks the LLM provider; swap Gemini for Groq here if needed.
 
     Tries each Gemini model in turn and returns (answer, model). Raises the last error if all fail.
@@ -186,7 +189,7 @@ def ask_llm(payload: dict) -> tuple[LLMReport, str]:
     errors = []
     for model in gemini_models():
         try:
-            return ask_gemini(payload, model), model
+            return ask_gemini(payload, model, prompt, schema), model
         except Exception as exc:
             errors.append(f"{model}: {type(exc).__name__}: {str(exc)[:300]}")
             if "GEMINI_API_KEY" in str(exc):

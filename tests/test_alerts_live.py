@@ -24,5 +24,5 @@ def test_real_webhook_accepts_a_message_with_an_image():
     if not url:
         pytest.skip("DISCORD_WEBHOOK_URL is not set")
     image = np.full((120, 320, 3), 255, dtype=np.uint8)
-    error = alerts.send_alert(url, "🧪 PPE Safety Checker: automated live test, please ignore.", alerts.encode_image(image))
+    error = alerts.send_to_discord(url, "🧪 PPE Safety Checker: automated live test, please ignore.", alerts.encode_image(image))
     assert error is None, error  # the error is already redacted, so the URL never shows in the output

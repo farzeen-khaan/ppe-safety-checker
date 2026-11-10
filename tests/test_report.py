@@ -149,7 +149,7 @@ def test_no_llm_never_calls_llm(monkeypatch):
 def test_tries_next_model_when_first_fails(monkeypatch):
     tried = []
 
-    def fake_gemini(payload, model):
+    def fake_gemini(payload, model, *options):
         tried.append(model)
         if model == "first":
             raise ConnectionError("503 overloaded")
@@ -164,7 +164,7 @@ def test_tries_next_model_when_first_fails(monkeypatch):
 
 
 def test_all_models_fail_gives_template_with_every_error(monkeypatch):
-    def always_fails(payload, model):
+    def always_fails(payload, model, *options):
         raise ConnectionError(f"{model} down")
 
     monkeypatch.setattr(report, "DEFAULT_MODELS", ["first", "second"])
