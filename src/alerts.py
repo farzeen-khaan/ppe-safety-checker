@@ -116,16 +116,19 @@ def encode_image(image_bgr: np.ndarray) -> bytes:
 
 # --- Sending ---
 
-def post_to_discord(url: str, content: str, image_jpg: bytes) -> requests.Response:
-    """One webhook call: the text plus the image as an attached file."""
+def post_to_discord(url: str, content: str, image_jpg: bytes | None = None) -> requests.Response:
+    """One webhook call: the text, plus the image as an attached file if there is one."""
     payload = {
         "content": content,
         # Never ping anyone, even if a photo name or report contains "@everyone".
         "allowed_mentions": {"parse": []},
     }
+    params = {"wait": "true"}  # Discord answers 200 only once the message really exists
+    if image_jpg is None:
+        return requests.post(url, params=params, json=payload, timeout=TIMEOUT_S)
     return requests.post(
         url,
-        params={"wait": "true"},  # Discord answers 200 only once the message really exists
+        params=params,
         data={"payload_json": json.dumps(payload)},
         files={"files[0]": ("ppe_alert.jpg", image_jpg, "image/jpeg")},
         timeout=TIMEOUT_S,
@@ -152,8 +155,11 @@ def describe(response: requests.Response) -> str:
     return f"HTTP {response.status_code}: {detail}".rstrip(": ")
 
 
-def send_alert(url: str, content: str, image_jpg: bytes) -> str | None:
-    """Post once and retry once. Returns None on success, or the error (webhook removed)."""
+def send_to_discord(url: str, content: str, image_jpg: bytes | None = None) -> str | None:
+    """Post once and retry once. Returns None on success, or the error (webhook removed).
+
+    Used by the alerts and the digest (F8).
+    """
     error = None
     for attempt in (1, 2):
         try:
@@ -191,7 +197,7 @@ def record(analysis_id: int | None, status: str, error: str | None = None) -> No
 def deliver(url: str, analysis_id: int | None, content: str, annotated: np.ndarray) -> str:
     """Background job: send and record the result. Never raises. Returns 'sent' or 'failed'."""
     try:
-        error = send_alert(url, content, encode_image(annotated))
+        error = send_to_discord(url, content, encode_image(annotated))
     except Exception as exc:  # a bug here must still end as a recorded failure
         error = redact(f"{type(exc).__name__}: {exc}", url)[:MAX_ERROR_CHARS]
     status = "sent" if error is None else "failed"
@@ -239,7 +245,7 @@ def main() -> None:
         return
     image = np.full((120, 320, 3), 255, dtype=np.uint8)
     cv2.putText(image, "PPE test", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 128, 0), 3)
-    error = send_alert(url, "✅ PPE Safety Checker: webhook test. Alerts are working.", encode_image(image))
+    error = send_to_discord(url, "✅ PPE Safety Checker: webhook test. Alerts are working.", encode_image(image))
     print("Sent." if error is None else f"Failed: {error}")
 
 
