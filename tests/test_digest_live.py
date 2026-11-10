@@ -2,7 +2,7 @@
 
     $env:RUN_LIVE_TESTS = "1"; python -m pytest -m live      # PowerShell
 
-test_real_digest_is_posted sends one digest, built from sample data in a temporary log,
+test_real_digest_is_posted sends one digest, built from sample data on the Neon test branch,
 to the channel in DISCORD_DIGEST_WEBHOOK_URL (or DISCORD_WEBHOOK_URL). It is labelled
 as a test so nobody mistakes it for a real day.
 """
@@ -40,11 +40,11 @@ def test_real_gemini_writes_an_overview():
         assert 0 < len(answer.overview) <= digest.MAX_OVERVIEW_CHARS
 
 
-def test_real_digest_is_posted():
+def test_real_digest_is_posted(db):
     url = digest.digest_webhook_url()
     if not url:
         pytest.skip("neither DISCORD_DIGEST_WEBHOOK_URL nor DISCORD_WEBHOOK_URL is set")
-    # conftest points INCIDENT_DB_PATH at a temporary file, so this never touches the real log.
+    # The db fixture points storage at the Neon test branch and empties it afterwards: never the real log.
     now = storage.now_utc()
     for has_helmet, has_vest, name in ((False, False, "live_test_1.jpg"), (True, False, "live_test_2.jpg")):
         verdicts = [PersonVerdict(Detection(5, "Person", 0.9, 0, 0, 100, 300), has_helmet, has_vest)]

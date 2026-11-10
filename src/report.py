@@ -14,12 +14,12 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-import cv2
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-from src.detect import DEFAULT_CONF, detect
-from src.violations import PersonVerdict, check_people, count_verdicts
+# Light imports only: the digest imports this module and must not load torch or OpenCV.
+# main() imports the detection model itself.
+from src.verdicts import PersonVerdict, count_verdicts
 
 load_dotenv()  # reads .env into environment variables; real environment variables win
 
@@ -220,6 +220,11 @@ def generate_report(verdicts: list[PersonVerdict], use_llm: bool = True) -> Repo
 
 
 def main() -> None:
+    import cv2  # heavy: only the command line needs them
+
+    from src.detect import DEFAULT_CONF, detect
+    from src.violations import check_people
+
     parser = argparse.ArgumentParser(description="Write an incident report for an image.")
     parser.add_argument("image", type=Path)
     parser.add_argument("--conf", type=float, default=DEFAULT_CONF, help="confidence threshold")

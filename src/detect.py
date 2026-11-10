@@ -9,7 +9,7 @@ For each image this saves an annotated copy and a JSON file of detections.
 import argparse
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 
@@ -17,22 +17,11 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from src.verdicts import Detection  # noqa: F401  (re-exported: src.detect.Detection)
+
 MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "best.pt"
 # Chosen in Phase 2: with the too-far cut-off, 0.25 had the fewest silent misses and false alarms.
 DEFAULT_CONF = 0.25
-
-
-@dataclass
-class Detection:
-    """One detected object. Box is in pixels: (x1, y1) top-left, (x2, y2) bottom-right."""
-
-    class_id: int
-    class_name: str
-    confidence: float
-    x1: float
-    y1: float
-    x2: float
-    y2: float
 
 
 @lru_cache(maxsize=1)

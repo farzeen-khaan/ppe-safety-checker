@@ -1,4 +1,8 @@
-"""Tests for F7 alerts. The HTTP call is replaced with a fake: nothing reaches Discord."""
+"""Tests for F7 alerts. The HTTP call is replaced with a fake: nothing reaches Discord.
+
+The log is an in-memory fake (AlertLog) unless a test takes the `db` fixture, which uses
+the real log on the Neon test branch.
+"""
 
 import json
 from datetime import datetime, timezone
@@ -8,7 +12,7 @@ import numpy as np
 import pytest
 import requests
 
-from src import alerts, pipeline, storage
+from src import alerts, discord_webhook, pipeline, storage
 from src.detect import Detection
 from src.report import Report
 from src.violations import PersonVerdict
@@ -61,32 +65,68 @@ def enabled(monkeypatch):
 def waits(monkeypatch):
     """Record retry waits instead of really sleeping."""
     slept = []
-    monkeypatch.setattr(alerts, "sleep", slept.append)
+    monkeypatch.setattr(discord_webhook, "sleep", slept.append)
     return slept
 
 
 def fake_discord(monkeypatch, *answers) -> FakeDiscord:
     fake = FakeDiscord(*answers)
-    monkeypatch.setattr(alerts.requests, "post", fake)
+    monkeypatch.setattr(discord_webhook.requests, "post", fake)
     return fake
+
+
+class AlertLog:
+    """In-memory stand-in for save_analysis and update_alert_status (rows built by storage.analysis_row)."""
+
+    def __init__(self):
+        self.rows: dict[int, dict] = {}
+
+    def save_analysis(self, **fields) -> int:
+        analysis_id = len(self.rows) + 1
+        self.rows[analysis_id] = {**storage.analysis_row(**fields), "alert_error": None}
+        return analysis_id
+
+    def update_alert_status(self, analysis_id, status, error=None):
+        if analysis_id not in self.rows:
+            raise KeyError(f"no analysis with id {analysis_id}")
+        self.rows[analysis_id].update(alert_status=status, alert_error=error)
+
+
+_log: AlertLog | None = None  # None: the test uses the real log (db fixture)
+
+
+@pytest.fixture(autouse=True)
+def alert_log(request, monkeypatch):
+    global _log
+    _log = None if "db" in request.fixturenames else AlertLog()
+    if _log is not None:
+        monkeypatch.setattr(alerts, "update_alert_status", _log.update_alert_status)
+        monkeypatch.setattr(pipeline, "save_analysis", _log.save_analysis)
+    yield _log
+    _log = None
+
+
+def stored(analysis_id: int) -> dict:
+    return _log.rows[analysis_id] if _log is not None else storage.get_analysis(analysis_id)
 
 
 def saved(verdicts) -> int:
     report = REPORT if any(v.is_violation for v in verdicts) else Report(
         "None", "All fine.", "None.", source="template", error="LLM disabled"
     )
-    return storage.save_analysis(
+    fields = dict(
         image_name="site.jpg", image_sha256="ab" * 32, image_width=200, image_height=100,
         verdicts=verdicts, report=report, model_version="best.pt:test", conf_threshold=0.25,
         processing_ms=100, created_at=T0,
     )
+    return _log.save_analysis(**fields) if _log is not None else storage.save_analysis(**fields)
 
 
 def run_alert(verdicts):
     analysis_id = saved(verdicts)
     status, future = alerts.alert_after_save(analysis_id, verdicts, REPORT, IMAGE, "site.jpg", T0)
     final = future.result(timeout=10) if future else None
-    return status, final, storage.get_analysis(analysis_id)
+    return status, final, stored(analysis_id)
 
 
 # --- When to alert ---
@@ -247,7 +287,21 @@ def test_pipeline_starts_alert_after_save(monkeypatch, enabled):
     fake_discord(monkeypatch, response(200))
     result = pipeline.finish_analysis(inspection(VIOLATION), "site.jpg", use_llm=False)
     assert result.alert_status == "sending" and result.alert.result(timeout=10) == "sent"
-    assert storage.get_analysis(result.analysis_id)["alert_status"] == "sent"
+    assert stored(result.analysis_id)["alert_status"] == "sent"
+
+
+def test_alert_outcomes_reach_the_real_log(db, monkeypatch, enabled, waits):
+    """Against Postgres: pending after the save, then sent or failed from the alert thread."""
+    fake_discord(monkeypatch, response(200), response(404, {"message": "Unknown Webhook"}))
+    sent = pipeline.finish_analysis(inspection(VIOLATION), "site.jpg", use_llm=False)
+    assert sent.alert.result(timeout=30) == "sent"
+    failed = pipeline.finish_analysis(inspection(VIOLATION), "site.jpg", use_llm=False)
+    assert failed.alert.result(timeout=30) == "failed"
+    rows = {r["id"]: r for r in storage.list_analyses()}
+    assert rows[sent.analysis_id]["alert_status"] == "sent" and rows[sent.analysis_id]["alert_updated_at"]
+    assert (rows[failed.analysis_id]["alert_status"], rows[failed.analysis_id]["alert_error"]) == (
+        "failed", "HTTP 404: Unknown Webhook"
+    )
 
 
 def test_pipeline_still_alerts_when_the_save_fails(monkeypatch, enabled):

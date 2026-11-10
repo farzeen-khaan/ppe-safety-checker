@@ -1,0 +1,17 @@
+# The daily digest only (python -m src.digest), as installed by GitHub Actions.
+# No torch, OpenCV or Ultralytics: the digest reads the log and posts text.
+# requirements.txt (the app) includes this file.
+
+# Incident log (F5): Postgres on Neon
+psycopg[binary]==3.3.8
+psycopg-pool==3.3.3
+
+# Overview (F8) and incident report wording (F4)
+google-genai==2.34.0
+pydantic==2.14.2
+
+# Discord webhook (F7, F8)
+requests==2.34.2
+
+# Config and secrets
+python-dotenv==1.2.4

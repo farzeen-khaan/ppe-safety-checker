@@ -18,7 +18,7 @@ import numpy as np
 from src.detect import load_model
 from src.pipeline import finish_analysis, inspect_image
 from src.report import Report
-from src.storage import PKT, get_analysis, list_analyses
+from src.storage import PKT, StorageUnavailable, get_analysis, list_analyses
 from src.violations import MIN_PERSON_HEIGHT, PersonVerdict, summary_text
 
 MAX_UPLOAD_MB = 20
@@ -126,7 +126,10 @@ def analyse(path: str | None):
 
 
 def load_history():
-    rows = list_analyses(limit=HISTORY_LIMIT)
+    try:
+        rows = list_analyses(limit=HISTORY_LIMIT)
+    except StorageUnavailable:  # e.g. Neon waking up or offline: say so, keep the app running
+        return [], "The incident log can't be reached right now. Press Refresh in a moment."
     note = f"{len(rows)} most recent analyses, newest first. Select a row to see its report." if rows else (
         "No analyses yet. Analyse a photo first."
     )
@@ -137,7 +140,10 @@ def show_details(evt: gr.SelectData):
     """When a History row is clicked: its report and per-person verdicts."""
     if not evt.row_value:
         return "", []
-    analysis = get_analysis(int(evt.row_value[0]))
+    try:
+        analysis = get_analysis(int(evt.row_value[0]))
+    except StorageUnavailable:
+        return "The incident log can't be reached right now. Try again in a moment.", []
     if analysis is None:
         return "That analysis no longer exists.", []
     text = (

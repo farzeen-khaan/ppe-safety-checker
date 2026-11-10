@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
 
 from src import report
-from src.alerts import MAX_CONTENT_CHARS, MAX_ERROR_CHARS, escape_markdown, redact, send_to_discord
+from src.discord_webhook import MAX_CONTENT_CHARS, MAX_ERROR_CHARS, escape_markdown, redact, send_to_discord
 from src.report import workers
 from src.storage import PKT, get_since, now_utc, record_digest_run
 
@@ -343,5 +343,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # The message has emoji; a Windows console defaults to a code page that can't print them.
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     sys.exit(main())
