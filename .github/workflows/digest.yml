@@ -1,0 +1,53 @@
+# F8 — Daily digest: read the last 24 hours of the incident log (Neon main branch)
+# and post the summary to Discord #daily-digest.
+#
+# Repository secrets (Settings → Secrets and variables → Actions → New repository secret):
+#   DATABASE_URL                Neon main branch connection string
+#   GEMINI_API_KEY              for the 3-sentence overview (a template is used if it fails)
+#   DISCORD_DIGEST_WEBHOOK_URL  webhook of the #daily-digest channel
+#
+# A non-zero exit from the digest (no webhook, log unreachable, Discord failure) fails the run.
+
+name: Daily digest
+
+on:
+  schedule:
+    - cron: "0 13 * * *"  # 13:00 UTC = 18:00 Pakistan time (no daylight saving)
+  workflow_dispatch: {}  # "Run workflow" button in the Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-digest
+  cancel-in-progress: false  # never cancel a digest halfway; a second run waits
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-digest.txt
+
+      - name: Install the digest's dependencies only (no torch, OpenCV or Ultralytics)
+        run: pip install -r requirements-digest.txt
+
+      - name: Send the digest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_DIGEST_WEBHOOK_URL: ${{ secrets.DISCORD_DIGEST_WEBHOOK_URL }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # GitHub can start scheduled runs late. Ending the window at 13:00 UTC today keeps
+            # consecutive daily windows back to back: no gap, no overlap.
+            python -m src.digest --until "$(date -u +%Y-%m-%d)T13:00:00Z"
+          else
+            python -m src.digest  # manual run: the 24 hours ending now
+          fi

@@ -21,13 +21,14 @@ The zones were measured on the training labels: they accept 98% of real helmets 
 """
 
 import argparse
-from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from src.detect import DEFAULT_CONF, Detection, detect
+from src.detect import DEFAULT_CONF, detect
+# The types and counts live in src.verdicts (no heavy imports) and are re-exported here.
+from src.verdicts import MIN_PERSON_HEIGHT, Detection, PersonVerdict, count_verdicts  # noqa: F401
 
 # Share of a PPE box that must lie inside the person's box for it to count for that person.
 MIN_OVERLAP = 0.5
@@ -38,51 +39,9 @@ ZONES = {
     "vest": (0.15, 0.70),
 }
 
-# People shorter than this share of the image height are too far to judge.
-# Calibrated on the 200 validation images: 15-20% is the first height band above 85% correct.
-MIN_PERSON_HEIGHT = 0.15
-
 GREEN = (0, 170, 0)  # OpenCV colours are BGR, not RGB
 RED = (0, 0, 220)
 GREY = (128, 128, 128)
-
-
-@dataclass
-class PersonVerdict:
-    """The decision for one detected person.
-
-    has_helmet / has_vest are None when the person is too far to judge: unknown, not missing.
-    """
-
-    person: Detection
-    has_helmet: bool | None
-    has_vest: bool | None
-
-    @property
-    def too_far(self) -> bool:
-        return self.has_helmet is None
-
-    @property
-    def missing(self) -> list[str]:
-        items = []
-        if self.has_helmet is False:
-            items.append("helmet")
-        if self.has_vest is False:
-            items.append("vest")
-        return items
-
-    @property
-    def is_violation(self) -> bool:
-        return bool(self.missing)
-
-    @property
-    def status(self) -> str:
-        """One of: compliant, missing helmet, missing vest, missing helmet and vest, too far to judge."""
-        if self.too_far:
-            return "too far to judge"
-        if not self.missing:
-            return "compliant"
-        return "missing " + " and ".join(self.missing)
 
 
 def overlap_fraction(item: Detection, x1: float, y1: float, x2: float, y2: float) -> float:
@@ -139,18 +98,6 @@ def check_people(detections: list[Detection], image_height: int) -> list[PersonV
                 )
             )
     return verdicts
-
-
-def count_verdicts(verdicts: list[PersonVerdict]) -> dict[str, int]:
-    """Counts used by the banner, and later by the report, log, alert and digest."""
-    too_far = sum(v.too_far for v in verdicts)
-    violations = sum(v.is_violation for v in verdicts)
-    return {
-        "people": len(verdicts),
-        "compliant": len(verdicts) - too_far - violations,
-        "violations": violations,
-        "too_far": too_far,
-    }
 
 
 def summary_text(verdicts: list[PersonVerdict]) -> str:

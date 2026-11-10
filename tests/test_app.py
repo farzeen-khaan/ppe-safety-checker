@@ -74,3 +74,23 @@ def test_show_details_for_a_clicked_history_row(monkeypatch):
     assert "Analysis #7" in text and "18:00 PKT" in text and "Report by template" in text
     assert people == [[1, "missing vest", "0.88"]]
     assert app.show_details(SimpleNamespace(row_value=[8]))[0] == "That analysis no longer exists."
+
+
+def test_history_says_so_when_the_log_is_unreachable(monkeypatch):
+    def unreachable(**kwargs):
+        raise app.StorageUnavailable("could not be reached")
+
+    monkeypatch.setattr(app, "list_analyses", unreachable)
+    rows, note = app.load_history()
+    assert rows == [] and "can't be reached right now" in note
+
+
+def test_details_say_so_when_the_log_is_unreachable(monkeypatch):
+    from types import SimpleNamespace
+
+    def unreachable(analysis_id):
+        raise app.StorageUnavailable("could not be reached")
+
+    monkeypatch.setattr(app, "get_analysis", unreachable)
+    text, people = app.show_details(SimpleNamespace(row_value=[7]))
+    assert "can't be reached right now" in text and people == []

@@ -1,12 +1,22 @@
-"""Tests for F8 digest. Each test uses a temporary log (conftest); Gemini and Discord are fakes."""
+"""Tests for F8 digest. Gemini and Discord are always fakes.
+
+Most tests run offline against FakeLog, an in-memory stand-in for the two storage functions
+the digest uses (get_since, record_digest_run). Its rows are built by storage.analysis_row,
+the same code save_analysis uses, so their columns and counts match the real log.
+Tests that take the `db` fixture use the real log on the Neon test branch instead.
+"""
 
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 import requests
 
-from src import alerts, digest, report, storage
+from src import digest, discord_webhook, report, storage
 from src.detect import Detection
 from src.report import Report
 from src.violations import PersonVerdict
@@ -26,21 +36,72 @@ OK, NO_HELMET, NO_VEST, NO_BOTH, FAR = (
 )
 
 
+class FakeLog:
+    """Stands in for storage.get_since and storage.record_digest_run, in memory."""
+
+    def __init__(self):
+        self.rows: list[dict] = []
+        self.runs: list[dict] = []  # newest first, like storage.list_digest_runs
+
+    def add(self, fields: dict, alert: str | None) -> int:
+        row = {"id": len(self.rows) + 1, **fields, "alert_error": None, "alert_updated_at": None}
+        row["created_at"] = storage.to_db_time(row["created_at"])
+        if alert:
+            row["alert_status"], row["alert_error"] = alert, None if alert == "sent" else "x"
+        self.rows.append(row)
+        return row["id"]
+
+    def get_since(self, since, until):
+        start, end = storage.to_db_time(since), storage.to_db_time(until)
+        found = [r for r in self.rows if start <= r["created_at"] < end]
+        return sorted(found, key=lambda r: (r["created_at"], r["id"]))
+
+    def record_digest_run(self, *, window_start, window_end, status, analyses_count=None, error=None):
+        self.runs.insert(0, {
+            "window_start": storage.to_db_time(window_start), "window_end": storage.to_db_time(window_end),
+            "status": status, "analyses_count": analyses_count, "error": error,
+        })
+
+
+_log: FakeLog | None = None  # None: the test uses the real log (db fixture)
+
+
+@pytest.fixture(autouse=True)
+def log(request, monkeypatch):
+    global _log
+    if "db" in request.fixturenames:
+        _log = None
+        yield None
+        return
+    _log = FakeLog()
+    monkeypatch.setattr(digest, "get_since", _log.get_since)
+    monkeypatch.setattr(digest, "record_digest_run", _log.record_digest_run)
+    yield _log
+    _log = None
+
+
 def add(verdicts, before: timedelta, gemini=True, name="site.jpg", alert=None) -> int:
-    """Save an analysis `before` the end of the window, with severity from the real rules."""
+    """Add an analysis `before` the end of the window, with severity from the real rules."""
     severity = report.compute_severity(verdicts)
     stored = (
         Report(severity, "S.", "A.", source="gemini", model="gemini-test") if gemini
         else Report(severity, "S.", "A.", source="template", error="LLM disabled")
     )
-    analysis_id = storage.save_analysis(
+    fields = dict(
         image_name=name, image_sha256="ab" * 32, image_width=640, image_height=480,
         verdicts=verdicts, report=stored, model_version="best.pt:test", conf_threshold=0.25,
         processing_ms=100, created_at=UNTIL - before,
     )
+    if _log is not None:
+        return _log.add(storage.analysis_row(**fields), alert)
+    analysis_id = storage.save_analysis(**fields)
     if alert:
         storage.update_alert_status(analysis_id, alert, None if alert == "sent" else "x")
     return analysis_id
+
+
+def runs() -> list[dict]:
+    return _log.runs if _log is not None else storage.list_digest_runs()
 
 
 def hours(n: float) -> timedelta:
@@ -69,7 +130,7 @@ def a_day():
 
 
 def rows(hours_back: int = 24):
-    return storage.get_since(UNTIL - timedelta(hours=hours_back), UNTIL)
+    return digest.get_since(UNTIL - timedelta(hours=hours_back), UNTIL)
 
 
 def no_llm(monkeypatch):
@@ -115,7 +176,8 @@ def test_full_message(a_day):
 
 # --- Window ---
 
-def test_window_boundaries():
+def test_window_boundaries(db):
+    """Against the real log: the boundary is decided by Postgres comparing TIMESTAMPTZ values."""
     second = timedelta(seconds=1)
     add([NO_HELMET], hours(24) + second, name="just outside")
     add([NO_HELMET], hours(24), name="exactly 24 h before")  # start: included
@@ -188,7 +250,7 @@ def test_empty_window_is_sent_and_recorded(monkeypatch):
     discord = fake_discord(monkeypatch, response(200))
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 0
     assert "No analyses in the last 24 hours" in discord.calls[0]["json"]["content"]
-    run = storage.list_digest_runs()[0]
+    run = runs()[0]
     assert (run["status"], run["analyses_count"], run["error"]) == ("sent", 0, None)
 
 
@@ -278,7 +340,7 @@ def test_over_the_limit_fails_instead_of_truncating(monkeypatch, a_day):
     monkeypatch.setattr(digest, "MAX_CONTENT_CHARS", 100)
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 1
     assert discord.calls == []  # nothing partial is ever sent
-    run = storage.list_digest_runs()[0]
+    run = runs()[0]
     assert run["status"] == "failed" and "over Discord's 100" in run["error"] and run["analyses_count"] == 6
 
 
@@ -321,8 +383,8 @@ class FakeDiscord:
 
 def fake_discord(monkeypatch, *answers) -> FakeDiscord:
     discord = FakeDiscord(*answers)
-    monkeypatch.setattr(alerts.requests, "post", discord)
-    monkeypatch.setattr(alerts, "sleep", lambda s: discord.calls.append({"slept": s}))
+    monkeypatch.setattr(discord_webhook.requests, "post", discord)
+    monkeypatch.setattr(discord_webhook, "sleep", lambda s: discord.calls.append({"slept": s}))
     return discord
 
 
@@ -333,7 +395,7 @@ def test_sends_one_message_and_records_it(monkeypatch, capsys, a_day):
     assert len(discord.calls) == 1 and discord.urls == [DIGEST_URL]
     assert discord.calls[0]["json"]["content"].startswith("📋 **Daily PPE digest")
     assert "Digest sent: 6 analyses" in capsys.readouterr().out
-    [run] = storage.list_digest_runs()
+    [run] = runs()
     assert run["window_start"] == "2026-11-09T13:00:00Z" and run["window_end"] == "2026-11-10T13:00:00Z"
     assert (run["status"], run["analyses_count"], run["error"]) == ("sent", 6, None)
 
@@ -364,7 +426,7 @@ def test_dry_run_sends_and_records_nothing(monkeypatch, capsys, a_day):
     assert digest.main([*UNTIL_ARG, "--dry-run", "--no-llm"]) == 0
     assert discord.calls == []
     assert capsys.readouterr().out.startswith("📋 **Daily PPE digest")
-    assert storage.list_digest_runs() == []
+    assert runs() == []
 
 
 def test_dry_run_needs_no_webhook(capsys):
@@ -375,7 +437,7 @@ def test_missing_webhook_fails_before_any_work(monkeypatch, capsys):
     monkeypatch.setattr(digest, "build_digest", lambda *a, **k: pytest.fail("must not build"))
     assert digest.main(UNTIL_ARG) == 1
     assert "DISCORD_DIGEST_WEBHOOK_URL" in capsys.readouterr().err
-    run = storage.list_digest_runs()[0]
+    run = runs()[0]
     assert (run["status"], run["analyses_count"], run["error"]) == ("failed", None, digest.NO_WEBHOOK)
 
 
@@ -385,7 +447,7 @@ def test_send_failure_exits_1_and_is_recorded(monkeypatch, capsys, a_day):
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 1
     assert len(discord.calls) == 1  # 404: not retried
     assert "Digest not sent: HTTP 404: Unknown Webhook" in capsys.readouterr().err
-    run = storage.list_digest_runs()[0]
+    run = runs()[0]
     assert (run["status"], run["analyses_count"], run["error"]) == ("failed", 6, "HTTP 404: Unknown Webhook")
 
 
@@ -394,7 +456,7 @@ def test_server_error_is_retried_once(monkeypatch, a_day):
     discord = fake_discord(monkeypatch, response(503), response(200))
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 0
     assert [c.get("slept") for c in discord.calls] == [None, 2, None]
-    assert storage.list_digest_runs()[0]["status"] == "sent"
+    assert runs()[0]["status"] == "sent"
 
 
 def test_rate_limit_waits_for_retry_after(monkeypatch, a_day):
@@ -409,7 +471,7 @@ def test_webhook_url_never_appears_in_stored_errors(monkeypatch, capsys, a_day):
     leak = requests.ConnectionError(f"Max retries exceeded with url: {DIGEST_URL}?wait=true (/api/webhooks/111/DIGEST-secret_token)")
     fake_discord(monkeypatch, leak, leak)
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 1
-    error = storage.list_digest_runs()[0]["error"]
+    error = runs()[0]["error"]
     assert error.startswith("ConnectionError")
     assert "DIGEST-secret_token" not in error and DIGEST_URL not in error
     assert "DIGEST-secret_token" not in capsys.readouterr().err
@@ -423,7 +485,7 @@ def test_unexpected_send_exception_is_redacted_and_recorded(monkeypatch, capsys,
 
     monkeypatch.setattr(digest, "send_to_discord", broken)
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 1
-    run = storage.list_digest_runs()[0]
+    run = runs()[0]
     assert run["error"] == "RuntimeError: bug while posting to <webhook>"
     assert "DIGEST-secret_token" not in capsys.readouterr().err
 
@@ -439,7 +501,7 @@ def test_unreadable_log_fails_without_sending(monkeypatch, capsys):
     assert digest.main(UNTIL_ARG) == 1
     assert discord.calls == []
     assert "OSError: disk unreadable" in capsys.readouterr().err
-    run = storage.list_digest_runs()[0]
+    run = runs()[0]
     assert (run["status"], run["analyses_count"], run["error"]) == ("failed", None, "OSError: disk unreadable")
 
 
@@ -453,3 +515,41 @@ def test_a_recording_problem_does_not_change_the_outcome(monkeypatch, capsys):
     monkeypatch.setattr(digest, "record_digest_run", broken)
     assert digest.main(["--no-llm"]) == 0  # the digest was delivered; re-running would post it twice
     assert "could not record the digest run" in capsys.readouterr().err
+
+# --- End to end on the real log ---
+
+def test_end_to_end_on_the_test_branch(db, monkeypatch, capsys):
+    """Real storage (Neon test branch), real retry code, fake Discord."""
+    monkeypatch.setenv("DISCORD_DIGEST_WEBHOOK_URL", DIGEST_URL)
+    worst = add([NO_HELMET, NO_VEST], hours(2), name="two.jpg", alert="failed")
+    add([NO_BOTH], hours(3), name="one.jpg", alert="sent")
+    add([OK, FAR], hours(4), gemini=False, name="ok.jpg")
+    add([NO_BOTH], hours(30), name="old.jpg")  # outside the window
+    discord = fake_discord(monkeypatch, response(200))
+    assert digest.main([*UNTIL_ARG, "--no-llm"]) == 0
+    content = discord.calls[0]["json"]["content"]
+    assert "**3 analyses** · 5 people detected · 4 checked · 🚨 3 in violation · ❔ 1 too far to judge" in content
+    assert f"1. 10 Nov 16:00 · two.jpg · 2 in violation · Medium (#{worst})" in content
+    assert "Reliability: alerts 1 sent · 1 failed | reports 2 by Gemini · 1 template" in content
+    [run] = storage.list_digest_runs()
+    assert (run["status"], run["analyses_count"], run["window_end"]) == ("sent", 3, "2026-11-10T13:00:00Z")
+
+
+# --- A light install ---
+
+def test_running_the_digest_never_imports_the_detection_stack():
+    """GitHub Actions installs requirements-digest.txt only: no torch, OpenCV or Ultralytics."""
+    script = "; ".join([
+        "import sys",
+        "import src.digest as d",
+        "d.get_since = lambda since, until: []",  # no database needed: an empty window
+        "code = d.main(['--dry-run', '--no-llm'])",
+        "heavy = sorted(m for m in ('torch', 'ultralytics', 'cv2', 'numpy', 'src.detect', 'src.violations',"
+        " 'src.alerts', 'gradio') if m in sys.modules)",
+        "print('HEAVY', heavy, 'EXIT', code)",
+    ])
+    env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"} | {"PYTHONIOENCODING": "utf-8"}
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env,
+                            cwd=Path(__file__).resolve().parent.parent, timeout=120, encoding="utf-8")
+    assert result.returncode == 0, result.stderr
+    assert "HEAVY [] EXIT 0" in result.stdout
