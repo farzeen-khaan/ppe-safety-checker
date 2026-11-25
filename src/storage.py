@@ -12,22 +12,25 @@ decisions.md; in short:
                      Holds the counts too, so History and the digest read one table.
 - person_verdicts:   one row per detected person, linked to its analysis.
 - digest_runs:       one row per daily digest run (F8): window, outcome, error.
+- rate_events:       one row per rate-limited request (hashed client, bucket, time).
 - schema_migrations: which numbered schema steps have been applied.
 
 CHECK constraints make the database reject impossible data (for example counts that
 don't add up), even if the Python code has a bug.
 
-Neon scales an idle branch to zero after 5 minutes, so the first connection after a
-pause can be slow. Each connection attempt may take 10 s and is retried once; after
-that, StorageUnavailable is raised with a clear message (never the password).
+Connections are short-lived: one per unit of work, closed straight after, through Neon's
+pooled connection string. Nothing runs in the background, so a serverless instance can be
+frozen after a response without leaving anything half-done. Neon scales an idle branch to
+zero after 5 minutes, so the first connection after a pause can be slow: each attempt may
+take 10 s and is retried once after 1 s; then StorageUnavailable is raised with a clear
+message (never the password).
 
 This module imports no detection code (only src.verdicts), so the digest stays light.
 """
 
 import argparse
-import atexit
 import os
-import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -36,7 +39,6 @@ from urllib.parse import urlsplit
 import psycopg
 from dotenv import load_dotenv
 from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool, PoolTimeout
 
 from src.report import Report  # light: no detection imports
 from src.verdicts import MIN_PERSON_HEIGHT, Detection, PersonVerdict, count_verdicts
@@ -53,13 +55,9 @@ DIGEST_STATUSES = ("sent", "failed", "skipped")  # since migration 4
 _V2_DIGEST_STATUSES = ("sent", "failed")  # what migration 2 created; released migrations never change
 
 # Cold starts: a sleeping Neon branch usually wakes in about a second. One attempt may take
-# CONNECT_TIMEOUT_S; the pool retries once after about 1 s (its first backoff step), so a
-# caller waits at most POOL_TIMEOUT_S before StorageUnavailable.
+# CONNECT_TIMEOUT_S; a failed attempt is retried once after RETRY_DELAY_S.
 CONNECT_TIMEOUT_S = 10
-POOL_TIMEOUT_S = 2 * CONNECT_TIMEOUT_S + 2
-# Idle connections are closed after a minute, so the pool never keeps Neon awake.
-MAX_IDLE_S = 60
-MAX_CONNECTIONS = 4  # Gradio handlers, the alert thread and the History tab, at most a few at once
+RETRY_DELAY_S = 1
 
 # Any fixed number: lets only one process apply migrations at a time (app and digest may start together).
 MIGRATION_LOCK_ID = 727_000_008
@@ -228,6 +226,25 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
             "CREATE INDEX idx_digest_runs_sent_end ON digest_runs (window_end) WHERE status = 'sent'",
         ],
     ),
+    (
+        5,
+        "Rate limiting per client",
+        [
+            """
+            CREATE TABLE rate_events (
+                id      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                bucket  TEXT        NOT NULL,   -- what was limited: 'analyze' or 'summary'
+                client  TEXT        NOT NULL,   -- SHA-256 of the client IP: never the IP itself
+                at      TIMESTAMPTZ NOT NULL,
+
+                CHECK (bucket IN ('analyze', 'summary')),
+                CHECK (client ~ '^[0-9a-f]{64}$')
+            )
+            """,
+            "CREATE INDEX idx_rate_events_lookup ON rate_events (bucket, client, at)",
+            "CREATE INDEX idx_rate_events_at ON rate_events (at)",  # for the cleanup of old rows
+        ],
+    ),
 ]
 
 
@@ -254,68 +271,43 @@ def _scrub(text: str, dsn: str) -> str:
     return text.replace(password, "<password>") if password else text
 
 
-_pools: dict[str, ConnectionPool] = {}
-_pools_lock = threading.Lock()
-
-
-def _pool(dsn: str) -> ConnectionPool:
-    """One small pool per connection string, created on first use."""
-    with _pools_lock:
-        pool = _pools.get(dsn)
-        if pool is None:
-            pool = ConnectionPool(
+def _open(dsn: str) -> psycopg.Connection:
+    """A new connection, retried once: the first attempt may hit a Neon branch that is still waking up."""
+    error = None
+    for attempt in (1, 2):
+        try:
+            return psycopg.Connection.connect(
                 dsn,
-                min_size=0,  # no connection is kept open when idle, so Neon can scale to zero
-                max_size=MAX_CONNECTIONS,
-                max_idle=MAX_IDLE_S,
-                timeout=POOL_TIMEOUT_S,
-                check=ConnectionPool.check_connection,  # a connection dropped while idle is replaced, not used
-                kwargs={
-                    "autocommit": True,  # no hidden transactions; transaction() starts them explicitly
-                    "row_factory": dict_row,  # rows behave like dicts: row["severity"]
-                    "connect_timeout": CONNECT_TIMEOUT_S,
-                    "prepare_threshold": None,  # the Neon pooler (PgBouncer) shares server connections
-                    "application_name": "ppe-safety-checker",
-                },
-                name="incident-log",
-                open=True,
+                autocommit=True,  # no hidden transactions; transaction() starts them explicitly
+                row_factory=dict_row,  # rows behave like dicts: row["severity"]
+                connect_timeout=CONNECT_TIMEOUT_S,
+                prepare_threshold=None,  # the Neon pooler (PgBouncer) shares server connections
+                application_name="ppe-safety-checker",
             )
-            _pools[dsn] = pool
-        return pool
-
-
-def close_pools() -> None:
-    """Close every pool (at exit, and between tests that change DATABASE_URL)."""
-    with _pools_lock:
-        for pool in _pools.values():
-            pool.close()
-        _pools.clear()
-    _initialised.clear()
-
-
-atexit.register(close_pools)
+        except psycopg.OperationalError as exc:
+            error = exc
+            if attempt == 1:
+                time.sleep(RETRY_DELAY_S)
+    raise StorageUnavailable(
+        f"The incident log ({describe_database(dsn)}) could not be reached after 2 attempts "
+        f"({_scrub(str(error), dsn)}). Neon may be waking up or unreachable; try again shortly."
+    ) from None
 
 
 @contextmanager
 def connect(dsn: str | None = None) -> Iterator[psycopg.Connection]:
-    """Borrow a connection for one unit of work, then give it back.
-
-    The pool hands each connection to one thread at a time, because Gradio runs requests
-    in threads and the alerts run on their own thread.
-    """
+    """A short-lived connection for one unit of work, closed afterwards (no pool, no background threads)."""
     dsn = dsn or database_url()
-    pool = _pool(dsn)
-    try:
-        conn = pool.getconn()
-    except PoolTimeout as exc:
-        raise StorageUnavailable(
-            f"The incident log ({describe_database(dsn)}) could not be reached within {POOL_TIMEOUT_S} s, "
-            f"retries included ({_scrub(str(exc), dsn)}). Neon may be waking up or unreachable; try again shortly."
-        ) from None
+    conn = _open(dsn)
     try:
         yield conn
     finally:
-        pool.putconn(conn)  # a broken connection, or one left inside a transaction, is discarded
+        conn.close()
+
+
+def reset() -> None:
+    """Forget which databases were migrated in this process (tests that rebuild the schema)."""
+    _initialised.clear()
 
 
 @contextmanager
@@ -474,6 +466,49 @@ def save_analysis(
                 [(analysis_id, *p) for p in people],
             )
     return analysis_id
+
+
+def update_report(analysis_id: int, report: Report, dsn: str | None = None) -> None:
+    """Replace the summary of a saved analysis (the second call of the web app). Severity stays as saved."""
+    with connect(_ensure_db(dsn)) as conn, transaction(conn):
+        cursor = conn.execute(
+            "UPDATE analyses SET report_summary = %s, report_action = %s, report_source = %s,"
+            " report_provider = %s, report_model = %s, report_error = %s WHERE id = %s",
+            (report.summary, report.recommended_action, report.source, report.provider, report.model,
+             report.error if report.source == "template" else None, analysis_id),
+        )
+        if cursor.rowcount == 0:
+            raise KeyError(f"no analysis with id {analysis_id}")
+
+
+RATE_EVENT_RETENTION = timedelta(days=1)  # longer than any limit window; older rows are deleted
+
+
+def rate_limit(bucket: str, client: str, limit: int, window: timedelta, dsn: str | None = None) -> int | None:
+    """Count one request for (bucket, client). Returns None if allowed, or seconds to wait if over the limit.
+
+    `client` is a hash (see app.client_key), never a raw IP. A request over the limit is not
+    counted. Old rows are deleted in the same transaction, so the table never grows.
+    """
+    now = _whole_seconds(now_utc())
+    with connect(_ensure_db(dsn)) as conn, transaction(conn):
+        # One client at a time per bucket: two parallel requests can't both take the last slot.
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"{bucket}:{client}",))
+        conn.execute("DELETE FROM rate_events WHERE at < %s", (now - RATE_EVENT_RETENTION,))
+        row = conn.execute(
+            "SELECT count(*) AS n, min(at) AS oldest FROM rate_events WHERE bucket = %s AND client = %s AND at > %s",
+            (bucket, client, now - window),
+        ).fetchone()
+        if row["n"] >= limit:
+            return max(1, int((row["oldest"] + window - now).total_seconds()))
+        conn.execute("INSERT INTO rate_events (bucket, client, at) VALUES (%s, %s, %s)", (bucket, client, now))
+    return None
+
+
+def ping(dsn: str | None = None) -> None:
+    """Raise StorageUnavailable if the database can't be reached (health check). Applies no migrations."""
+    with connect(dsn) as conn:
+        conn.execute("SELECT 1")
 
 
 def update_alert_status(analysis_id: int, status: str, error: str | None = None, dsn: str | None = None) -> None:

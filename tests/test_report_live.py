@@ -13,7 +13,7 @@ import re
 import pytest
 
 from src import digest, llm, report
-from src.detect import Detection
+from src.verdicts import Detection
 from src.violations import PersonVerdict
 
 pytestmark = [

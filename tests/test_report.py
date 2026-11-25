@@ -6,7 +6,7 @@ The model is always a fake (llm.generate is replaced); nothing calls the real AP
 import pytest
 
 from src import llm, report
-from src.detect import Detection
+from src.verdicts import Detection
 from src.report import LLMReport, build_payload, compute_severity, generate_report, template_report
 from src.violations import PersonVerdict
 

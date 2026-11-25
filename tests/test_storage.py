@@ -13,12 +13,12 @@ import pytest
 from psycopg import errors
 
 from src import storage
-from src.detect import Detection
+from src.verdicts import Detection
 from src.report import Report
 from src.violations import PersonVerdict
 
 T0 = datetime(2026, 11, 5, 13, 0, 0, tzinfo=timezone.utc)
-ALL_TABLES = "digest_runs, person_verdicts, analyses, schema_migrations"
+ALL_TABLES = "rate_events, digest_runs, person_verdicts, analyses, schema_migrations"
 
 
 def person(has_helmet, has_vest, x1=0.0) -> PersonVerdict:
@@ -53,7 +53,7 @@ def versions(db) -> list[int]:
 def drop_everything(db) -> None:
     with storage.connect(db) as conn:
         conn.execute(f"DROP TABLE IF EXISTS {ALL_TABLES} CASCADE")
-    storage._initialised.discard(db)
+    storage.reset()
 
 
 @pytest.fixture
@@ -61,7 +61,7 @@ def fresh(db):
     """The test branch with no tables at all; fully migrated again afterwards."""
     drop_everything(db)
     yield db
-    storage._initialised.discard(db)
+    storage.reset()
     storage.init_db(db)
 
 
@@ -73,7 +73,7 @@ def test_init_is_idempotent_and_records_migrations(db):
         tables = {r["table_name"] for r in conn.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()"
         )}
-    assert versions(db) == [1, 2, 3, 4]
+    assert versions(db) == [1, 2, 3, 4, 5]
     assert {"analyses", "person_verdicts", "digest_runs", "schema_migrations"} <= tables
 
 
@@ -93,7 +93,7 @@ def test_existing_version_1_log_is_upgraded(fresh):
             (T0,),
         ).fetchone()["id"]
     storage.init_db(fresh)
-    assert versions(fresh) == [1, 2, 3, 4]
+    assert versions(fresh) == [1, 2, 3, 4, 5]
     assert storage.get_analysis(old_id)["image_name"] == "old.jpg"
     assert storage.list_digest_runs() == []
 
@@ -125,7 +125,7 @@ def test_processes_starting_together_migrate_once(fresh):
         t.start()
     for t in threads:
         t.join()
-    assert failures == [] and versions(fresh) == [1, 2, 3, 4]
+    assert failures == [] and versions(fresh) == [1, 2, 3, 4, 5]
 
 
 # --- Round trip ---
@@ -370,18 +370,15 @@ def test_no_database_url_is_a_clear_error():
 
 def test_unreachable_database_gives_a_clear_error_without_the_password(monkeypatch):
     monkeypatch.setattr(storage, "CONNECT_TIMEOUT_S", 1)
-    monkeypatch.setattr(storage, "POOL_TIMEOUT_S", 2)
+    monkeypatch.setattr(storage, "RETRY_DELAY_S", 0.1)
     dsn = "postgresql://someone:S3CRET-pw@127.0.0.1:1/incidents"  # nothing listens on port 1
     started = time.perf_counter()
-    try:
-        with pytest.raises(storage.StorageUnavailable) as caught:
-            storage.list_analyses(dsn=dsn)
-    finally:
-        storage.close_pools()
+    with pytest.raises(storage.StorageUnavailable) as caught:
+        storage.list_analyses(dsn=dsn)
     message = str(caught.value)
-    assert "incident log (127.0.0.1/incidents) could not be reached within 2 s" in message
+    assert "incident log (127.0.0.1/incidents) could not be reached after 2 attempts" in message
     assert "S3CRET-pw" not in message and "someone" not in message
-    assert time.perf_counter() - started < 10  # bounded: the app never hangs on the log
+    assert time.perf_counter() - started < 10  # bounded: a request never hangs on the log
 
 
 def test_describe_database_never_shows_credentials():
@@ -389,8 +386,7 @@ def test_describe_database_never_shows_credentials():
 
 
 def test_first_connect_failing_is_retried(db, monkeypatch):
-    """A Neon branch waking up may refuse or time out the first connection; one retry follows."""
-    storage.close_pools()  # no warm connections: the next call must connect
+    """A Neon branch waking up may refuse or time out the first connection; one retry follows after 1 s."""
     real_connect = psycopg.Connection.connect
     attempts = []
 
@@ -403,7 +399,15 @@ def test_first_connect_failing_is_retried(db, monkeypatch):
     monkeypatch.setattr(psycopg.Connection, "connect", classmethod(flaky))
     assert storage.list_analyses() == []
     assert len(attempts) == 2
-    assert 0.5 < attempts[1] - attempts[0] < 3  # the pool's first backoff step is about 1 s
+    assert 0.9 < attempts[1] - attempts[0] < 3  # RETRY_DELAY_S = 1
+
+
+def test_each_unit_of_work_gets_its_own_connection_and_closes_it(db):
+    with storage.connect() as a:
+        pass
+    with storage.connect() as b:
+        pass
+    assert a is not b and a.closed and b.closed  # nothing left open for a frozen instance to hold
 
 
 def test_migration_3_moves_the_provider_into_its_own_column(fresh):
@@ -439,8 +443,65 @@ def test_migration_4_allows_skipped_runs_and_keeps_old_ones(fresh):
             conn.execute(insert, (T0, T0 - timedelta(hours=1), T0, "skipped", "r"))
         conn.execute(insert, (T0, T0 - timedelta(hours=24), T0, "sent", None))
     storage.init_db(fresh)
-    assert versions(fresh) == [1, 2, 3, 4]
+    assert versions(fresh) == [1, 2, 3, 4, 5]
     storage.record_digest_run(window_start=T0, window_end=T0 + timedelta(hours=1), status="skipped",
                               error="skipped: covered", dsn=fresh)
     assert [r["status"] for r in storage.list_digest_runs(dsn=fresh)] == ["skipped", "sent"]
     assert storage.last_successful_digest_end(dsn=fresh) == T0
+
+
+# --- The second call: replacing the standard summary ---
+
+def test_update_report_replaces_the_summary_and_keeps_severity(db):
+    analysis_id = save(report=Report("High", "Standard.", "Check.", source="template", error="summary not written yet"))
+    storage.update_report(analysis_id, Report("Medium", "Written.", "Verify.", source="llm", provider="p", model="m"))
+    a = storage.get_analysis(analysis_id)
+    assert (a["report_summary"], a["report_action"], a["report_source"], a["report_provider"], a["report_model"],
+            a["report_error"]) == ("Written.", "Verify.", "llm", "p", "m", None)
+    assert a["severity"] == "High"  # severity comes from the rules at save time, never from the summary
+
+
+def test_update_report_unknown_id(db):
+    with pytest.raises(KeyError):
+        storage.update_report(999, Report("None", "s", "a", source="template", error="x"))
+
+
+# --- Rate limiting (migration 5) ---
+
+CLIENT = "a" * 64  # a SHA-256 hex digest, as app.client_key produces
+
+
+def test_rate_limit_allows_up_to_the_limit_then_says_how_long_to_wait(db):
+    window = timedelta(hours=1)
+    assert [storage.rate_limit("analyze", CLIENT, 3, window) for _ in range(3)] == [None, None, None]
+    retry = storage.rate_limit("analyze", CLIENT, 3, window)
+    assert 3500 < retry <= 3600  # until the oldest of the three leaves the window
+    with storage.connect(db) as conn:  # the refused request was not counted
+        assert conn.execute("SELECT count(*) AS n FROM rate_events").fetchone()["n"] == 3
+
+
+def test_rate_limit_counts_buckets_and_clients_separately(db):
+    window = timedelta(hours=1)
+    storage.rate_limit("analyze", CLIENT, 1, window)
+    assert storage.rate_limit("summary", CLIENT, 1, window) is None
+    assert storage.rate_limit("analyze", "b" * 64, 1, window) is None
+    assert storage.rate_limit("analyze", CLIENT, 1, window) is not None
+
+
+def test_rate_limit_deletes_old_rows(db):
+    with storage.connect(db) as conn:
+        conn.execute("INSERT INTO rate_events (bucket, client, at) VALUES ('analyze', %s, now() - interval '2 days')", (CLIENT,))
+    storage.rate_limit("analyze", CLIENT, 10, timedelta(hours=1))
+    with storage.connect(db) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM rate_events").fetchone()["n"] == 1  # only the new one
+
+
+@pytest.mark.parametrize("client", ["192.168.1.1", "A" * 64, "a" * 63])
+def test_rate_events_store_only_hashes(db, client):
+    """The database refuses anything that isn't a lowercase SHA-256 hex digest: an IP can't be stored by mistake."""
+    with pytest.raises(errors.CheckViolation):
+        storage.rate_limit("analyze", client, 10, timedelta(hours=1))
+
+
+def test_ping(db):
+    storage.ping()  # no exception: reachable

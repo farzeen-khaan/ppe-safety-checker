@@ -1,7 +1,4 @@
-"""F2 — Violation rules and F3 — annotated image.
-
-Usage:
-    python -m src.violations IMAGE [IMAGE ...] [--conf 0.25] [--out outputs]
+"""F2 — Violation rules: pure Python, no OpenCV and no detection imports.
 
 For each person the model finds, decide whether they wear a helmet and a vest.
 
@@ -20,14 +17,7 @@ The zones were measured on the training labels: they accept 98% of real helmets 
 99.6% of real vests, while giving under 2% to a neighbouring person.
 """
 
-import argparse
-from pathlib import Path
-
-import cv2
-import numpy as np
-
-from src.detect import DEFAULT_CONF, detect
-# The types and counts live in src.verdicts (no heavy imports) and are re-exported here.
+# The types and counts live in src.verdicts and are re-exported here for existing callers.
 from src.verdicts import MIN_PERSON_HEIGHT, Detection, PersonVerdict, count_verdicts  # noqa: F401
 
 # Share of a PPE box that must lie inside the person's box for it to count for that person.
@@ -38,11 +28,6 @@ ZONES = {
     "helmet": (0.0, 1 / 3),
     "vest": (0.15, 0.70),
 }
-
-GREEN = (0, 170, 0)  # OpenCV colours are BGR, not RGB
-RED = (0, 0, 220)
-GREY = (128, 128, 128)
-
 
 def overlap_fraction(item: Detection, x1: float, y1: float, x2: float, y2: float) -> float:
     """Share of the item's box area that lies inside the rectangle (x1, y1, x2, y2)."""
@@ -111,66 +96,3 @@ def summary_text(verdicts: list[PersonVerdict]) -> str:
         f"{c['people']} {noun}: {c['compliant']} compliant, "
         f"{c['violations']} in violation, {c['too_far']} too far to judge"
     )
-
-
-def draw_verdicts(image: np.ndarray, verdicts: list[PersonVerdict]) -> np.ndarray:
-    """F3: draw each person green (compliant), red (violation) or grey (too far), plus a summary banner."""
-    annotated = image.copy()
-    # Scale lines and text with the image, so labels stay readable on large photos.
-    scale = max(image.shape[:2]) / 1000
-    thickness = max(1, round(2 * scale))
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    for v in verdicts:
-        p = v.person
-        if v.too_far:
-            color, label = GREY, "Too far"
-        elif v.is_violation:
-            color, label = RED, "No " + " + ".join(v.missing)
-        else:
-            color, label = GREEN, "OK"
-        top_left = (int(p.x1), int(p.y1))
-        cv2.rectangle(annotated, top_left, (int(p.x2), int(p.y2)), color, thickness)
-
-        # Filled label background so text is readable on any photo.
-        (tw, th), base = cv2.getTextSize(label, font, 0.6 * scale, thickness)
-        y_top = top_left[1] - th - base
-        if y_top < 0:  # no room above the box: put the label just inside it
-            y_top = top_left[1]
-        cv2.rectangle(annotated, (top_left[0], y_top), (top_left[0] + tw, y_top + th + base), color, -1)
-        cv2.putText(annotated, label, (top_left[0], y_top + th), font, 0.6 * scale, (255, 255, 255), thickness, cv2.LINE_AA)
-
-    # Summary banner in the bottom-left corner, where it rarely covers a person's label.
-    text = summary_text(verdicts)
-    (tw, th), base = cv2.getTextSize(text, font, 0.8 * scale, thickness)
-    pad = int(10 * scale)
-    height = image.shape[0]
-    banner_top = height - (th + base + 2 * pad)
-    cv2.rectangle(annotated, (0, banner_top), (tw + 2 * pad, height), (0, 0, 0), -1)
-    cv2.putText(annotated, text, (pad, banner_top + pad + th), font, 0.8 * scale, (255, 255, 255), thickness, cv2.LINE_AA)
-    return annotated
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Check PPE compliance per person.")
-    parser.add_argument("images", nargs="+", type=Path, help="image files to analyse")
-    parser.add_argument("--conf", type=float, default=DEFAULT_CONF, help="confidence threshold")
-    parser.add_argument("--out", type=Path, default=Path("outputs"), help="output folder")
-    args = parser.parse_args()
-
-    args.out.mkdir(parents=True, exist_ok=True)
-    for path in args.images:
-        image = cv2.imread(str(path))
-        if image is None:
-            print(f"Skipping {path}: not a readable image")
-            continue
-
-        verdicts = check_people(detect(image, conf=args.conf), image_height=image.shape[0])
-        cv2.imwrite(str(args.out / f"{path.stem}_verdicts.jpg"), draw_verdicts(image, verdicts))
-        print(f"{path.name}: {summary_text(verdicts)}")
-        for i, v in enumerate(verdicts, 1):
-            print(f"  person {i} ({v.person.confidence:.2f}): {v.status}")
-
-
-if __name__ == "__main__":
-    main()

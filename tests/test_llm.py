@@ -1,7 +1,6 @@
 """Tests for src/llm.py: configuration, model order, fallback and errors. The SDK call is a fake."""
 
 import json
-import logging
 
 import pytest
 from pydantic import BaseModel
@@ -42,17 +41,12 @@ def test_new_names_are_read(monkeypatch):
     assert llm.models() == ["mine", "a", "b"]
 
 
-def test_old_names_still_work_for_one_release_with_a_warning(monkeypatch, caplog):
+def test_old_names_are_no_longer_read(monkeypatch):
+    """GEMINI_API_KEY / GEMINI_MODEL were read for one release (polish pass) and removed in Phase 8b."""
     monkeypatch.setenv("GEMINI_API_KEY", "old-key")
     monkeypatch.setenv("GEMINI_MODEL", "old-model")
-    monkeypatch.setattr(llm, "_warned", set())
-    with caplog.at_level(logging.WARNING, logger="src.llm"):
-        assert llm.api_key() == "old-key"
-        assert llm.api_key() == "old-key"
-        assert llm.models()[0] == "old-model"
-    warnings = [r.getMessage() for r in caplog.records]
-    assert warnings.count("GEMINI_API_KEY is deprecated; rename it to LLM_API_KEY.") == 1  # once, not per call
-    assert "GEMINI_MODEL is deprecated; rename it to LLM_MODEL." in warnings
+    monkeypatch.setattr(llm, "DEFAULT_MODELS", ["a"])
+    assert llm.api_key() is None and llm.models() == ["a"]
 
 
 def test_no_key_and_no_model_setting(monkeypatch):

@@ -4,7 +4,6 @@
 # Repository secrets (Settings → Secrets and variables → Actions → New repository secret):
 #   DATABASE_URL                Neon main branch connection string
 #   LLM_API_KEY                 for the 3-sentence summary (the standard summary is used if it fails)
-#                               (GEMINI_API_KEY is still read for one release if LLM_API_KEY is missing)
 #   DISCORD_DIGEST_WEBHOOK_URL  webhook of the #daily-digest channel
 #
 # The window comes from the log, not the clock: from the end of the last successful digest to
@@ -52,7 +51,7 @@ jobs:
       - name: Send the digest
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY || secrets.GEMINI_API_KEY }}  # old name: remove next release
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           DISCORD_DIGEST_WEBHOOK_URL: ${{ secrets.DISCORD_DIGEST_WEBHOOK_URL }}
           HOURS: ${{ inputs.hours }}  # via env, never pasted into the script: no shell injection
         run: |

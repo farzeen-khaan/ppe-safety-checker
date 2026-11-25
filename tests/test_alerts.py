@@ -13,7 +13,7 @@ import pytest
 import requests
 
 from src import alerts, discord_webhook, pipeline, storage
-from src.detect import Detection
+from src.verdicts import Detection
 from src.report import Report
 from src.violations import PersonVerdict
 
@@ -124,8 +124,8 @@ def saved(verdicts) -> int:
 
 def run_alert(verdicts):
     analysis_id = saved(verdicts)
-    status, future = alerts.alert_after_save(analysis_id, verdicts, REPORT, IMAGE, "site.jpg", T0)
-    final = future.result(timeout=10) if future else None
+    status = alerts.alert_after_save(analysis_id, verdicts, REPORT, IMAGE, "site.jpg", T0)  # synchronous
+    final = status if status in ("sent", "failed") else None
     return status, final, stored(analysis_id)
 
 
@@ -135,7 +135,7 @@ def test_violation_sends_image_and_message(monkeypatch, enabled):
     fake = fake_discord(monkeypatch, response(200))
     status, final, row = run_alert(VIOLATION)
 
-    assert (status, final, row["alert_status"], row["alert_error"]) == ("sending", "sent", "sent", None)
+    assert (status, final, row["alert_status"], row["alert_error"]) == ("sent", "sent", "sent", None)
     assert len(fake.calls) == 1
     call = fake.calls[0]
     assert call["files"]["files[0]"][1][:2] == b"\xff\xd8"  # the annotated image, as JPEG bytes
@@ -326,26 +326,42 @@ def test_large_images_are_downscaled():
     assert max(decoded.shape[:2]) == alerts.MAX_IMAGE_SIDE
 
 
-# --- Pipeline integration ---
+# --- Pipeline integration (synchronous: the alert is done when analyze() returns) ---
 
-def inspection(verdicts) -> pipeline.Inspection:
-    return pipeline.Inspection(verdicts, IMAGE, 200, 100, "ab" * 32, 0.25, started=0.0)
+@pytest.fixture
+def inspected(monkeypatch):
+    """analyze() without the model: inspect_image returns the given verdicts."""
+    def use(verdicts):
+        monkeypatch.setattr(pipeline, "inspect_image", lambda image, conf=0.25: pipeline.Inspection(
+            verdicts, IMAGE, 200, 100, "ab" * 32, 0.25, started=0.0))
+    return use
 
 
-def test_pipeline_starts_alert_after_save(monkeypatch, enabled):
+def test_analyze_sends_the_alert_before_returning(monkeypatch, enabled, inspected):
     fake_discord(monkeypatch, response(200))
-    result = pipeline.finish_analysis(inspection(VIOLATION), "site.jpg", use_llm=False)
-    assert result.alert_status == "sending" and result.alert.result(timeout=10) == "sent"
+    inspected(VIOLATION)
+    result = pipeline.analyze(IMAGE, "site.jpg")
+    assert result.alert_status == "sent"
     assert stored(result.analysis_id)["alert_status"] == "sent"
 
 
-def test_alert_outcomes_reach_the_real_log(db, monkeypatch, enabled, waits):
-    """Against Postgres: pending after the save, then sent or failed from the alert thread."""
+def test_the_alert_carries_the_rule_based_facts(monkeypatch, enabled, inspected):
+    """The written summary doesn't exist yet when the alert goes out: the alert has the standard one."""
+    fake = fake_discord(monkeypatch, response(200))
+    inspected(VIOLATION)
+    pipeline.analyze(IMAGE, "site.jpg")
+    embed = json.loads(fake.calls[0]["data"]["payload_json"])["embeds"][0]
+    assert embed["description"].startswith("The flagged workers are missing")
+    assert embed["footer"]["text"].startswith("Standard summary, built from the figures above")
+
+
+def test_alert_outcomes_reach_the_real_log(db, monkeypatch, enabled, waits, inspected):
+    """Against Postgres: pending at the save, then sent or failed, all inside analyze()."""
     fake_discord(monkeypatch, response(200), response(404, {"message": "Unknown Webhook"}))
-    sent = pipeline.finish_analysis(inspection(VIOLATION), "site.jpg", use_llm=False)
-    assert sent.alert.result(timeout=30) == "sent"
-    failed = pipeline.finish_analysis(inspection(VIOLATION), "site.jpg", use_llm=False)
-    assert failed.alert.result(timeout=30) == "failed"
+    inspected(VIOLATION)
+    sent = pipeline.analyze(IMAGE, "site.jpg")
+    failed = pipeline.analyze(IMAGE, "site.jpg")
+    assert (sent.alert_status, failed.alert_status) == ("sent", "failed")
     rows = {r["id"]: r for r in storage.list_analyses()}
     assert rows[sent.analysis_id]["alert_status"] == "sent" and rows[sent.analysis_id]["alert_updated_at"]
     assert (rows[failed.analysis_id]["alert_status"], rows[failed.analysis_id]["alert_error"]) == (
@@ -353,20 +369,27 @@ def test_alert_outcomes_reach_the_real_log(db, monkeypatch, enabled, waits):
     )
 
 
-def test_pipeline_still_alerts_when_the_save_fails(monkeypatch, enabled):
+def test_pipeline_still_alerts_when_the_save_fails(monkeypatch, enabled, inspected):
     fake = fake_discord(monkeypatch, response(200))
 
     def broken_save(**kwargs):
         raise OSError("disk full")
 
     monkeypatch.setattr(pipeline, "save_analysis", broken_save)
-    result = pipeline.finish_analysis(inspection(VIOLATION), "site.jpg", use_llm=False)
-    assert result.save_error and result.alert.result(timeout=10) == "sent"
+    inspected(VIOLATION)
+    result = pipeline.analyze(IMAGE, "site.jpg")
+    assert result.save_error and result.alert_status == "sent"
     fields = json.loads(fake.calls[0]["data"]["payload_json"])["embeds"][0]["fields"]
     assert {"name": "Analysis", "value": "Not saved to the log", "inline": True} in fields
 
 
-def test_dry_run_never_alerts(monkeypatch, enabled):
+def test_dry_run_never_alerts(monkeypatch, enabled, inspected):
     fake = fake_discord(monkeypatch)
-    result = pipeline.finish_analysis(inspection(VIOLATION), "site.jpg", use_llm=False, save=False)
-    assert (result.alert_status, result.alert) == ("not_needed", None) and fake.calls == []
+    inspected(VIOLATION)
+    result = pipeline.analyze(IMAGE, "site.jpg", save=False)
+    assert result.alert_status == "not_needed" and fake.calls == []
+
+
+def test_no_background_threads():
+    import src.alerts as module
+    assert not hasattr(module, "_executor")
