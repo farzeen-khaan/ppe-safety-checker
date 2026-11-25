@@ -3,7 +3,8 @@
 #
 # Repository secrets (Settings → Secrets and variables → Actions → New repository secret):
 #   DATABASE_URL                Neon main branch connection string
-#   GEMINI_API_KEY              for the 3-sentence overview (a template is used if it fails)
+#   LLM_API_KEY                 for the 3-sentence summary (the standard summary is used if it fails)
+#                               (GEMINI_API_KEY is still read for one release if LLM_API_KEY is missing)
 #   DISCORD_DIGEST_WEBHOOK_URL  webhook of the #daily-digest channel
 #
 # A non-zero exit from the digest (no webhook, log unreachable, Discord failure) fails the run.
@@ -27,9 +28,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5  # v5+: Node 24 (v4 warned that Node 20 is deprecated)
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6  # v6+: Node 24
         with:
           python-version: "3.12"
           cache: pip
@@ -41,7 +42,7 @@ jobs:
       - name: Send the digest
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY || secrets.GEMINI_API_KEY }}  # old name: remove next release
           DISCORD_DIGEST_WEBHOOK_URL: ${{ secrets.DISCORD_DIGEST_WEBHOOK_URL }}
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then

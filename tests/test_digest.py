@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 import requests
 
-from src import digest, discord_webhook, report, storage
+from src import digest, discord_webhook, llm, report, storage
 from src.detect import Detection
 from src.report import Report
 from src.violations import PersonVerdict
@@ -84,7 +84,7 @@ def add(verdicts, before: timedelta, gemini=True, name="site.jpg", alert=None) -
     """Add an analysis `before` the end of the window, with severity from the real rules."""
     severity = report.compute_severity(verdicts)
     stored = (
-        Report(severity, "S.", "A.", source="gemini", model="gemini-test") if gemini
+        Report(severity, "S.", "A.", source="llm", provider="acme", model="model-x") if gemini
         else Report(severity, "S.", "A.", source="template", error="LLM disabled")
     )
     fields = dict(
@@ -134,7 +134,15 @@ def rows(hours_back: int = 24):
 
 
 def no_llm(monkeypatch):
-    monkeypatch.setattr(report, "ask_llm", lambda *a, **k: pytest.fail("Gemini must not be called"))
+    monkeypatch.setattr(llm, "generate", lambda *a, **k: pytest.fail("the model must not be called"))
+
+
+def model_says(text, model="model-x"):
+    return lambda prompt, facts, schema: llm.Generated(schema(summary=text), "acme", model)
+
+
+def fields(d) -> dict:
+    return {f["name"]: f["value"] for f in d.embed["fields"]}
 
 
 # --- Aggregation ---
@@ -146,32 +154,49 @@ def test_aggregation_matches_a_hand_count(a_day):
         "people_detected": 14, "checked_for_ppe": 11, "compliant": 4, "in_violation": 7, "too_far_to_judge": 3,
         "missing_helmet_only": 4, "missing_vest_only": 2, "missing_helmet_and_vest": 1,
         "severity_high": 2, "severity_medium": 2, "severity_none": 2,
-        "reports_gemini": 4, "reports_template": 2,
+        "summaries_automated": 4, "summaries_standard": 2,
         "alerts_sent": 2, "alerts_failed": 1, "alerts_disabled": 1, "alerts_pending": 0,
     }
 
 
-def test_full_message(a_day):
-    message = digest.build_digest(UNTIL - hours(24), UNTIL, use_llm=False).message
-    lines = message.split("\n")
-    assert lines[:7] == [
-        "📋 **Daily PPE digest — 10 Nov 2026**",
-        "Window: 09 Nov 18:00 – 10 Nov 18:00 PKT",
-        "",
-        "**6 analyses** · 14 people detected · 11 checked · 🚨 7 in violation · ❔ 3 too far to judge",
-        "Violations: 4 missing helmet · 2 missing vest · 1 missing both",
-        "Severity: 2 High · 2 Medium · 2 None",
-        "",
-    ]
-    assert lines[7:11] == [
-        "**Worst analyses**",
-        f"1. 10 Nov 13:00 · site\\_c.jpg · 3 in violation · High (#{a_day['C']})",  # 08:00 UTC shown in PKT
-        f"2. 10 Nov 17:00 · e.jpg · 2 in violation · Medium (#{a_day['E']})",
-        f"3. 10 Nov 08:00 · b.jpg · 1 in violation · High (#{a_day['B']})",
-    ]
-    assert "**Overview** (template: Gemini was unavailable)" in message
-    assert lines[-1] == "Reliability: alerts 2 sent · 1 failed · 1 disabled | reports 4 by Gemini · 2 template"
-    assert "yesterday" not in message
+def test_full_embed(a_day):
+    d = digest.build_digest(UNTIL - hours(24), UNTIL, use_llm=False)
+    assert d.content == "📋 Daily PPE digest — 10 Nov 2026: 6 analyses, 7 workers in violation"
+    e = d.embed
+    assert (e["title"], e["description"]) == ("Daily PPE digest — 10 Nov 2026", "Window: 09 Nov 18:00 – 10 Nov 18:00 PKT")
+    assert e["color"] == digest.COLOURS["High"]  # the worst severity in the window
+    assert fields(d) == {
+        "Analyses": "6", "People detected": "14", "Checked": "11", "In violation": "7", "Not checked (too far)": "3",
+        "Severity": "2 High · 2 Medium · 2 None",
+        "Violations": "4 missing helmet · 2 missing vest · 1 missing both",
+        "Worst analyses": "\n".join([
+            f"1. 10 Nov 13:00 · site\\_c.jpg · 3 in violation · High (#{a_day['C']})",  # 08:00 UTC shown in PKT
+            f"2. 10 Nov 17:00 · e.jpg · 2 in violation · Medium (#{a_day['E']})",
+            f"3. 10 Nov 08:00 · b.jpg · 1 in violation · High (#{a_day['B']})",
+        ]),
+        "Summary": fields(d)["Summary"],
+        "Reliability": "Alerts: 2 sent · 1 failed · 1 not sent (alerts off)\nSummaries: 4 automated, 2 standard",
+    }
+    assert e["footer"]["text"] == "Standard summary, built from the figures above · 10 Nov 2026, 18:00 PKT"
+    assert e["timestamp"] == "2026-11-10T13:00:00+00:00"
+    assert "yesterday" not in json.dumps(e)
+
+
+def test_colour_is_the_worst_severity_present():
+    add([NO_HELMET], hours(1))
+    assert digest.build_digest(UNTIL - hours(24), UNTIL, use_llm=False).embed["color"] == digest.COLOURS["Medium"]
+    add([OK], hours(2))
+    add([NO_BOTH], hours(3))
+    assert digest.build_digest(UNTIL - hours(24), UNTIL, use_llm=False).embed["color"] == digest.COLOURS["High"]
+
+
+def test_no_vendor_or_model_name_reaches_the_user(monkeypatch, a_day):
+    monkeypatch.setattr(llm, "generate", model_says("Three short sentences.", model="model-x"))
+    d = digest.build_digest(UNTIL - hours(24), UNTIL)
+    text = (d.content + json.dumps(d.embed)).lower()
+    for hidden in ("acme", "model-x", "gemini", "llm"):
+        assert hidden not in text
+    assert d.embed["footer"]["text"].startswith("Automated summary, check against the figures above")
 
 
 # --- Window ---
@@ -191,8 +216,8 @@ def test_window_boundaries(db):
 def test_hours_option_changes_the_window(monkeypatch, capsys, a_day):
     assert digest.main([*UNTIL_ARG, "--hours", "4", "--dry-run", "--no-llm"]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("📋 **PPE digest, last 4 hours — 10 Nov 2026**\nWindow: 10 Nov 14:00 – 10 Nov 18:00 PKT")
-    assert "**3 analyses**" in out  # D, F, E; C is 5 h before
+    assert "**PPE digest, last 4 hours — 10 Nov 2026**\nWindow: 10 Nov 14:00 – 10 Nov 18:00 PKT" in out
+    assert "**Analyses**\n3\n" in out  # D, F, E; C is 5 h before
 
 
 @pytest.mark.parametrize("value", ["0", "-3", "abc"])
@@ -236,112 +261,145 @@ def test_worst_same_second_uses_the_later_id():
 
 def test_empty_window_message(monkeypatch):
     no_llm(monkeypatch)
-    result = digest.build_digest(UNTIL - hours(24), UNTIL)
-    assert result.analyses == 0
-    assert result.message == (
-        "📋 **Daily PPE digest — 10 Nov 2026**\n"
+    d = digest.build_digest(UNTIL - hours(24), UNTIL)
+    assert (d.analyses, d.content) == (0, "📋 Daily PPE digest — 10 Nov 2026: no analyses in the last 24 hours")
+    assert d.embed["description"] == (
         "Window: 09 Nov 18:00 – 10 Nov 18:00 PKT\n\n"
         "No analyses in the last 24 hours. The digest ran normally; there was nothing to report."
     )
+    assert d.embed["color"] == digest.GREY and "fields" not in d.embed
+    assert d.embed["footer"]["text"] == "10 Nov 2026, 18:00 PKT"  # no summary, so no summary note
 
 
 def test_empty_window_is_sent_and_recorded(monkeypatch):
     monkeypatch.setenv("DISCORD_DIGEST_WEBHOOK_URL", DIGEST_URL)
     discord = fake_discord(monkeypatch, response(200))
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 0
-    assert "No analyses in the last 24 hours" in discord.calls[0]["json"]["content"]
+    assert "No analyses in the last 24 hours" in discord.calls[0]["json"]["embeds"][0]["description"]
     run = runs()[0]
     assert (run["status"], run["analyses_count"], run["error"]) == ("sent", 0, None)
 
 
-# --- Overview ---
+# --- Summary ---
 
-def test_gemini_gets_aggregates_only(monkeypatch, a_day):
+def test_model_gets_aggregates_only_and_the_rules(monkeypatch, a_day):
     sent = {}
 
-    def fake_llm(facts, prompt, schema):
-        sent["facts"] = facts
-        return schema(overview="Three sentences. About the day. Done."), "gemini-test"
+    def fake(prompt, facts, schema):
+        sent.update(prompt=prompt, facts=facts, schema=schema)
+        return model_says("Three sentences. About the day. Done.")(prompt, facts, schema)
 
-    monkeypatch.setattr(report, "ask_llm", fake_llm)
-    message = digest.build_digest(UNTIL - hours(24), UNTIL).message
-    assert "**Overview** (Gemini, gemini-test)\nThree sentences. About the day. Done." in message
+    monkeypatch.setattr(llm, "generate", fake)
+    d = digest.build_digest(UNTIL - hours(24), UNTIL)
+    assert fields(d)["Summary"] == "Three sentences. About the day. Done." and d.automated
     facts = sent["facts"]
-    assert set(facts) == set(digest.OVERVIEW_FACTS) | {
+    assert set(facts) == set(digest.SUMMARY_FACTS) | {
         "missing_helmet_total", "missing_vest_total", "violation_rate_of_checked_pct"
     }
     assert all(isinstance(v, int) for v in facts.values())  # numbers only: no names, ids or lists
     assert (facts["missing_helmet_total"], facts["missing_vest_total"], facts["violation_rate_of_checked_pct"]) == (5, 3, 64)
+    assert facts["checked_for_ppe"] == facts["compliant"] + facts["in_violation"]
+    assert sent["schema"] is digest.DigestSummary
+    for rule in ("Use only the facts", "it is important to", "never call them compliant", "camera",
+                 "site supervisor", "do not repeat them", "Do not restate the counts", 'never say "stop work"',
+                 "Verify on site, then correct:", "2 or 3 short sentences"):
+        assert rule.lower() in sent["prompt"].lower(), rule
 
 
-@pytest.mark.parametrize("answer", [RuntimeError("503 overloaded"), "", "x" * (digest.MAX_OVERVIEW_CHARS + 1)])
-def test_gemini_failure_gives_template_overview(monkeypatch, a_day, answer):
-    def fake_llm(facts, prompt, schema):
+@pytest.mark.parametrize("answer", [llm.LLMUnavailable("a: 503"), "", "x" * (digest.MAX_SUMMARY_CHARS + 1)])
+def test_model_failure_gives_the_standard_summary(monkeypatch, a_day, answer):
+    def fake(prompt, facts, schema):
         if isinstance(answer, Exception):
             raise answer
-        return schema(overview=answer), "gemini-test"
+        return model_says(answer)(prompt, facts, schema)
 
-    monkeypatch.setattr(report, "ask_llm", fake_llm)
-    result = digest.build_digest(UNTIL - hours(24), UNTIL)
-    assert result.overview_model is None
-    assert "**Overview** (template: Gemini was unavailable)\n6 analyses checked 11 workers for PPE; 7 (64%)" in result.message
+    monkeypatch.setattr(llm, "generate", fake)
+    d = digest.build_digest(UNTIL - hours(24), UNTIL)
+    assert not d.automated
+    assert fields(d)["Summary"].startswith("Most workers in violation are missing helmets.")
+    assert d.embed["footer"]["text"].startswith("Standard summary, built from the figures above")
 
 
-def test_gemini_failure_through_the_real_model_chain(monkeypatch, a_day):
-    """report.ask_llm itself (not a fake): every model fails, so the digest falls back."""
+def test_model_failure_through_the_real_interface(monkeypatch, a_day):
+    """llm.generate itself (not a fake): every model fails, so the digest falls back."""
     tried = []
 
-    def failing_gemini(payload, model, prompt, schema):
+    def failing_call(text, schema, model):
         tried.append(model)
         raise TimeoutError("deadline exceeded")
 
-    monkeypatch.setattr(report, "ask_gemini", failing_gemini)
-    monkeypatch.setattr(report, "DEFAULT_MODELS", ["first", "second"])
-    monkeypatch.delenv("GEMINI_MODEL", raising=False)
-    result = digest.build_digest(UNTIL - hours(24), UNTIL)
-    assert tried == ["first", "second"] and result.overview_model is None
+    monkeypatch.setattr(llm, "_call", failing_call)
+    monkeypatch.setattr(llm, "DEFAULT_MODELS", ["first", "second"])
+    d = digest.build_digest(UNTIL - hours(24), UNTIL)
+    assert tried == ["first", "second"] and not d.automated
 
 
-def test_template_overview_wording(a_day):
-    text = digest.template_overview(digest.overview_facts(digest.summarise(rows())))
+def test_standard_summary_wording(a_day):
+    text = digest.template_summary(digest.summary_facts(digest.summarise(rows())))
     assert text == (
-        "6 analyses checked 11 workers for PPE; 7 (64%) were in violation. "
-        "The most common problem was a missing helmet (5 workers). "
-        "3 workers could not be checked because they were too far from the camera. "
-        "Tomorrow, prioritise helmet checks and closer photos so every worker can be checked."
+        "Most workers in violation are missing helmets. "
+        "Some workers were too far from the camera to check. "
+        "Verify on site, then correct: check helmets and vests at the start of tomorrow's shift, "
+        "and move the camera closer so more workers can be checked."
     )
+    assert not any(ch.isdigit() for ch in text)  # the fields already show every count
 
 
-def test_template_overview_when_nobody_could_be_checked():
+def test_standard_summary_when_nobody_could_be_checked():
     add([FAR, FAR], hours(2), gemini=False)
-    text = digest.template_overview(digest.overview_facts(digest.summarise(rows())))
-    assert "none were close enough to check" in text
+    text = digest.template_summary(digest.summary_facts(digest.summarise(rows())))
+    assert text == (
+        "No worker could be checked: everyone was too far from the camera. "
+        "Move the camera closer so more workers can be checked tomorrow."
+    )
     assert "compliant" not in text and "None%" not in text
+
+
+def test_standard_summary_without_violations():
+    add([OK, OK], hours(2), gemini=False)
+    text = digest.template_summary(digest.summary_facts(digest.summarise(rows())))
+    assert text == "No checked worker was missing PPE. No PPE action needed tomorrow."
+
+
+def test_standard_summary_never_says_stop_work_and_is_short(a_day):
+    add([NO_BOTH] * 2 + [FAR] * 20, hours(2))  # 23 of 36 people too far: over half
+    text = digest.template_summary(digest.summary_facts(digest.summarise(rows())))
+    assert "stop work" not in text.lower() and text.count(". ") + 1 <= 3
+    assert "Half or more of the people detected were too far from the camera to check." in text
+
+
+def test_disabled_alerts_read_as_not_sent(a_day):
+    reliability = fields(digest.build_digest(UNTIL - hours(24), UNTIL, use_llm=False))["Reliability"]
+    assert "1 not sent (alerts off)" in reliability and "disabled" not in reliability
 
 
 # --- Length and mentions ---
 
-def test_many_analyses_stay_under_discords_limit(monkeypatch):
-    # Worst case per part: 200 rows, names that double when markdown-escaped, a maximum-length overview.
+def test_many_analyses_stay_within_discords_limits(monkeypatch):
+    # Worst case per part: 200 rows, names that double when markdown-escaped, a maximum-length summary.
     for i in range(200):
         add([NO_BOTH] * 5 + [FAR] * 5, timedelta(minutes=i + 1), name="_" * 300 + f"{i}.jpg", alert="failed")
-    monkeypatch.setattr(
-        report, "ask_llm", lambda facts, prompt, schema: (schema(overview="y" * digest.MAX_OVERVIEW_CHARS), "m" * 60)
-    )
-    message = digest.build_digest(UNTIL - hours(24), UNTIL).message
-    assert len(message) <= digest.MAX_CONTENT_CHARS
-    assert "**200 analyses**" in message
-    assert sum(line[:3] in ("1. ", "2. ", "3. ") for line in message.split("\n")) == 3
+    monkeypatch.setattr(llm, "generate", model_says("y" * digest.MAX_SUMMARY_CHARS))
+    d = digest.build_digest(UNTIL - hours(24), UNTIL)
+    assert digest.embed_problems(d.content, [d.embed]) == []
+    assert fields(d)["Analyses"] == "200"
+    assert fields(d)["Worst analyses"].count("\n") == 2  # only the top 3
+    for line in fields(d)["Worst analyses"].split("\n"):
+        assert ".jpg" in line  # shortened names keep their extension
 
 
 def test_over_the_limit_fails_instead_of_truncating(monkeypatch, a_day):
     monkeypatch.setenv("DISCORD_DIGEST_WEBHOOK_URL", DIGEST_URL)
     discord = fake_discord(monkeypatch)
-    monkeypatch.setattr(digest, "MAX_CONTENT_CHARS", 100)
+    monkeypatch.setitem(digest_limits(), "total", 100)
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 1
     assert discord.calls == []  # nothing partial is ever sent
     run = runs()[0]
-    assert run["status"] == "failed" and "over Discord's 100" in run["error"] and run["analyses_count"] == 6
+    assert run["status"] == "failed" and "embeds total" in run["error"] and run["analyses_count"] == 6
+
+
+def digest_limits() -> dict:
+    return discord_webhook.EMBED_LIMITS
 
 
 def test_mentions_never_ping(monkeypatch):
@@ -350,7 +408,7 @@ def test_mentions_never_ping(monkeypatch):
     discord = fake_discord(monkeypatch, response(200))
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 0
     payload = discord.calls[0]["json"]
-    assert "@everyone" in payload["content"]  # shown as text...
+    assert "@everyone" in payload["embeds"][0]["fields"][7]["value"]  # shown as text...
     assert payload["allowed_mentions"] == {"parse": []}  # ...but Discord is told to ping nobody
 
 
@@ -393,7 +451,8 @@ def test_sends_one_message_and_records_it(monkeypatch, capsys, a_day):
     discord = fake_discord(monkeypatch, response(200))
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 0
     assert len(discord.calls) == 1 and discord.urls == [DIGEST_URL]
-    assert discord.calls[0]["json"]["content"].startswith("📋 **Daily PPE digest")
+    assert discord.calls[0]["json"]["content"].startswith("📋 Daily PPE digest")
+    assert discord.calls[0]["json"]["embeds"][0]["title"] == "Daily PPE digest — 10 Nov 2026"
     assert "Digest sent: 6 analyses" in capsys.readouterr().out
     [run] = runs()
     assert run["window_start"] == "2026-11-09T13:00:00Z" and run["window_end"] == "2026-11-10T13:00:00Z"
@@ -425,7 +484,7 @@ def test_dry_run_sends_and_records_nothing(monkeypatch, capsys, a_day):
     discord = fake_discord(monkeypatch)  # any call would fail: no answers queued
     assert digest.main([*UNTIL_ARG, "--dry-run", "--no-llm"]) == 0
     assert discord.calls == []
-    assert capsys.readouterr().out.startswith("📋 **Daily PPE digest")
+    assert capsys.readouterr().out.startswith("📋 Daily PPE digest")
     assert runs() == []
 
 
@@ -480,7 +539,7 @@ def test_webhook_url_never_appears_in_stored_errors(monkeypatch, capsys, a_day):
 def test_unexpected_send_exception_is_redacted_and_recorded(monkeypatch, capsys, a_day):
     monkeypatch.setenv("DISCORD_DIGEST_WEBHOOK_URL", DIGEST_URL)
 
-    def broken(url, content):
+    def broken(url, content, **kwargs):
         raise RuntimeError(f"bug while posting to {url}")
 
     monkeypatch.setattr(digest, "send_to_discord", broken)
@@ -527,10 +586,12 @@ def test_end_to_end_on_the_test_branch(db, monkeypatch, capsys):
     add([NO_BOTH], hours(30), name="old.jpg")  # outside the window
     discord = fake_discord(monkeypatch, response(200))
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 0
-    content = discord.calls[0]["json"]["content"]
-    assert "**3 analyses** · 5 people detected · 4 checked · 🚨 3 in violation · ❔ 1 too far to judge" in content
-    assert f"1. 10 Nov 16:00 · two.jpg · 2 in violation · Medium (#{worst})" in content
-    assert "Reliability: alerts 1 sent · 1 failed | reports 2 by Gemini · 1 template" in content
+    embed = discord.calls[0]["json"]["embeds"][0]
+    got = {f["name"]: f["value"] for f in embed["fields"]}
+    assert (got["Analyses"], got["People detected"], got["Checked"], got["In violation"],
+            got["Not checked (too far)"]) == ("3", "5", "4", "3", "1")
+    assert got["Worst analyses"].startswith(f"1. 10 Nov 16:00 · two.jpg · 2 in violation · Medium (#{worst})")
+    assert got["Reliability"].split("\n") == ["Alerts: 1 sent · 1 failed", "Summaries: 2 automated, 1 standard"]
     [run] = storage.list_digest_runs()
     assert (run["status"], run["analyses_count"], run["window_end"]) == ("sent", 3, "2026-11-10T13:00:00Z")
 

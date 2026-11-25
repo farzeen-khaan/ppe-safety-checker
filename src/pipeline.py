@@ -5,7 +5,7 @@ Usage:
 
 The work is split in two so the web UI can show results early:
 - inspect_image():   detection, rules and annotated image (fast, about 1 s)
-- finish_analysis(): incident report, save, then start the alert (slow when Gemini is slow)
+- finish_analysis(): incident report, save, then start the alert (slow when the model is slow)
 analyse_image() runs both. The alert is sent on a background thread and never delays the result.
 """
 

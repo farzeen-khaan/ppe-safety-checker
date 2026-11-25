@@ -26,11 +26,11 @@ def person(has_helmet, has_vest, x1=0.0) -> PersonVerdict:
     return PersonVerdict(person=box, has_helmet=has_helmet, has_vest=has_vest)
 
 
-GEMINI_REPORT = Report("High", "Summary.", "Action.", source="gemini", model="gemini-test")
+LLM_REPORT = Report("High", "Summary.", "Action.", source="llm", provider="acme", model="model-x")
 TEMPLATE_REPORT = Report("None", "Summary.", "Action.", source="template", error="LLM disabled")
 
 
-def save(verdicts=None, report=GEMINI_REPORT, created_at=T0, name="photo.jpg") -> int:
+def save(verdicts=None, report=LLM_REPORT, created_at=T0, name="photo.jpg") -> int:
     return storage.save_analysis(
         image_name=name,
         image_sha256="ab" * 32,
@@ -73,7 +73,7 @@ def test_init_is_idempotent_and_records_migrations(db):
         tables = {r["table_name"] for r in conn.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()"
         )}
-    assert versions(db) == [1, 2]
+    assert versions(db) == [1, 2, 3]
     assert {"analyses", "person_verdicts", "digest_runs", "schema_migrations"} <= tables
 
 
@@ -93,7 +93,7 @@ def test_existing_version_1_log_is_upgraded(fresh):
             (T0,),
         ).fetchone()["id"]
     storage.init_db(fresh)
-    assert versions(fresh) == [1, 2]
+    assert versions(fresh) == [1, 2, 3]
     assert storage.get_analysis(old_id)["image_name"] == "old.jpg"
     assert storage.list_digest_runs() == []
 
@@ -125,7 +125,7 @@ def test_processes_starting_together_migrate_once(fresh):
         t.start()
     for t in threads:
         t.join()
-    assert failures == [] and versions(fresh) == [1, 2]
+    assert failures == [] and versions(fresh) == [1, 2, 3]
 
 
 # --- Round trip ---
@@ -136,7 +136,7 @@ def test_save_and_read_back(db):
     assert a["created_at"] == "2026-11-05T13:00:00Z"  # TIMESTAMPTZ, returned as the same UTC text as before
     assert (a["people_count"], a["compliant_count"], a["violation_count"], a["too_far_count"]) == (3, 1, 1, 1)
     assert a["missing_both_count"] == 1
-    assert (a["report_source"], a["report_model"], a["report_error"]) == ("gemini", "gemini-test", None)
+    assert (a["report_source"], a["report_provider"], a["report_model"], a["report_error"]) == ("llm", "acme", "model-x", None)
     assert a["min_person_height"] == 0.15 and a["conf_threshold"] == 0.25  # DOUBLE PRECISION: exact
     assert a["model_version"] == "best.pt:test"
 
@@ -200,7 +200,7 @@ def insert_raw(db, **changes):
         "min_person_height": 0.15, "people_count": 1, "compliant_count": 1, "violation_count": 0,
         "too_far_count": 0, "missing_helmet_only_count": 0, "missing_vest_only_count": 0,
         "missing_both_count": 0, "severity": "None", "report_summary": "s", "report_action": "a",
-        "report_source": "gemini", "report_model": "m", "report_error": None,
+        "report_source": "llm", "report_provider": "p", "report_model": "m", "report_error": None,
         "alert_status": "not_needed", "processing_ms": 1,
     } | changes
     with storage.connect(db) as conn:
@@ -220,7 +220,9 @@ def test_valid_raw_row_is_accepted(db):
         {"people_count": 2},                                     # counts don't add up
         {"violation_count": 1, "compliant_count": 0},            # violations without a breakdown
         {"report_source": "template"},                           # template needs a reason, no model
-        {"report_model": None},                                  # gemini needs a model
+        {"report_model": None},                                  # an automated summary needs a model
+        {"report_provider": None},                               # ...and a provider
+        {"report_source": "gemini"},                             # the pre-migration-3 value is gone
         {"conf_threshold": 1.5},
         {"processing_ms": -1},
         {"alert_status": "maybe"},
@@ -279,7 +281,7 @@ def test_failed_save_leaves_nothing_behind(db):
 
 def test_connection_is_usable_after_a_failed_save(db):
     with pytest.raises(errors.CheckViolation):
-        save(verdicts=[person(True, True)], report=Report("Bad", "s", "a", source="gemini", model="m"))
+        save(verdicts=[person(True, True)], report=Report("Bad", "s", "a", source="llm", provider="p", model="m"))
     assert storage.get_analysis(save()) is not None  # the pool discarded nothing it shouldn't have
 
 
@@ -402,3 +404,27 @@ def test_first_connect_failing_is_retried(db, monkeypatch):
     assert storage.list_analyses() == []
     assert len(attempts) == 2
     assert 0.5 < attempts[1] - attempts[0] < 3  # the pool's first backoff step is about 1 s
+
+
+def test_migration_3_moves_the_provider_into_its_own_column(fresh):
+    """A v2 log (provider stored as the source) keeps every row; the provider moves, the source becomes 'llm'."""
+    storage.init_db(fresh, migrations=storage.MIGRATIONS[:2])
+    insert = (
+        "INSERT INTO analyses (created_at, image_name, image_sha256, image_width, image_height, model_version,"
+        " conf_threshold, min_person_height, people_count, compliant_count, violation_count, too_far_count,"
+        " missing_helmet_only_count, missing_vest_only_count, missing_both_count, severity, report_summary,"
+        " report_action, report_source, report_model, report_error, alert_status, processing_ms)"
+        " VALUES (%s, %s, 'ab', 10, 10, 'm', 0.25, 0.15, 0, 0, 0, 0, 0, 0, 0, 'None', 's', 'a', %s, %s, %s,"
+        " 'not_needed', 1) RETURNING id"
+    )
+    with storage.connect(fresh) as conn:
+        automated = conn.execute(insert, (T0, "old-automated.jpg", "gemini", "gemini-3.5-flash-lite", None)).fetchone()["id"]
+        standard = conn.execute(insert, (T0, "old-standard.jpg", "template", None, "LLM disabled")).fetchone()["id"]
+    storage.init_db(fresh)
+    a, b = storage.get_analysis(automated), storage.get_analysis(standard)
+    assert (a["report_source"], a["report_provider"], a["report_model"]) == ("llm", "gemini", "gemini-3.5-flash-lite")
+    assert (b["report_source"], b["report_provider"], b["report_model"], b["report_error"]) == (
+        "template", None, None, "LLM disabled"
+    )
+    with pytest.raises(errors.CheckViolation):  # the new rule holds for new rows too
+        insert_raw(fresh, report_provider=None)

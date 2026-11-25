@@ -1,45 +1,44 @@
-"""F7 — Violation alerts: post the annotated photo and a short message to a Discord webhook.
+"""F7 — Violation alerts: post the annotated photo and an embed to a Discord webhook.
 
 Usage:
     python -m src.alerts --test     # post one test message, to check the webhook works
 
-The pipeline calls alert_after_save() once an analysis is saved. Sending happens on a
+The pipeline calls alert_after_save() once an analysis is saved. The send runs on a
 background thread, so the web UI never waits for Discord. The outcome (sent, failed,
 disabled) is written to the analysis's alert status in the incident log.
-
-The webhook URL is a secret: anyone who has it can post to the channel. It is never
-printed, logged or stored; error messages pass through redact() first.
 """
 
 import argparse
 import logging
 import os
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 
 import cv2
 import numpy as np
 from dotenv import load_dotenv
 
-# The Discord HTTP code is shared with the digest; re-exported here for existing callers.
+# Shared with the digest; re-exported for existing callers.
 from src.discord_webhook import (  # noqa: F401
-    MAX_CONTENT_CHARS, MAX_ERROR_CHARS, MAX_RETRY_AFTER_S, RETRY_DELAY_S, TIMEOUT_S,
-    describe, escape_markdown, post_to_discord, redact, retry_after, send_to_discord,
+    COLOURS, IMAGE_FILENAME, MAX_CONTENT_CHARS, MAX_ERROR_CHARS, MAX_RETRY_AFTER_S, RETRY_DELAY_S,
+    TIMEOUT_S, describe, embed_problems, escape_markdown, footer_text, post_to_discord, redact,
+    retry_after, send_to_discord, shorten_name, summary_note,
 )
-from src.report import Report, build_payload, workers
+from src.report import Report, build_payload, violation_parts, workers
 from src.storage import PKT, now_utc, update_alert_status
 
 load_dotenv()
 log = logging.getLogger(__name__)
 
-MAX_IMAGE_SIDE = 1600  # downscale before upload: smaller and faster, boxes stay readable
+MAX_IMAGE_SIDE = 1600  # smaller and faster to upload; boxes stay readable
+MAX_SUMMARY_CHARS = 1500  # well inside the 4096 embed description limit
+MAX_ACTION_CHARS = 1000  # field values are limited to 1024
 
 # One worker: alerts go out one at a time, which suits Discord's per-webhook rate limit.
-# Non-daemon threads, so a command-line run waits for its alerts before exiting.
+# Non-daemon, so a command-line run waits for its alerts before exiting.
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="alert")
 
-
-# --- Configuration ---
 
 def webhook_config() -> tuple[str | None, str | None]:
     """(webhook URL, None) when alerts are on, or (None, reason) when they are off."""
@@ -53,36 +52,47 @@ def webhook_config() -> tuple[str | None, str | None]:
 
 # --- Message ---
 
-def build_message(
+@dataclass
+class AlertMessage:
+    content: str  # one plain line: what notifications and previews show
+    embed: dict
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def build_alert(
     verdicts, report: Report, analysis_id: int | None, image_name: str, created_at: datetime
-) -> str:
-    """The alert text: severity, who is in violation, who could not be checked, summary, time."""
+) -> AlertMessage:
+    """Severity colour, counts as fields, the summary, the annotated image, and the time."""
     p = build_payload(verdicts)
-    breakdown = [
-        f"{n} missing {item}"
-        for n, item in (
-            (p["missing_helmet_only"], "helmet"),
-            (p["missing_vest_only"], "vest"),
-            (p["missing_helmet_and_vest"], "helmet and vest"),
-        )
-        if n
-    ]
-    lines = [
-        f"🚨 **PPE violation — {report.severity} severity**",
-        f"**{p['in_violation']} of {workers(p['checked_for_ppe'])} checked in violation:** {', '.join(breakdown)}.",
+    title = f"PPE violation — {report.severity} severity"
+    fields = [
+        {"name": "In violation", "value": f"{p['in_violation']} of {workers(p['checked_for_ppe'])} checked",
+         "inline": True},
+        {"name": "Missing", "value": violation_parts(p), "inline": True},
     ]
     if p["too_far_to_judge"]:
-        people = "1 person" if p["too_far_to_judge"] == 1 else f"{p['too_far_to_judge']} people"
-        lines.append(f"**{people} could not be checked** (too far to judge).")
-    reference = f"Analysis #{analysis_id}" if analysis_id is not None else "Analysis not saved to the log"
-    when = created_at.astimezone(PKT).strftime("%d %b %Y, %H:%M PKT")
-    footer = f"{reference} · {escape_markdown(image_name[:100])} · {when}"
-
-    # The summary is the only long, variable part, so it gets whatever room is left.
-    label = "**Report:** "
-    room = MAX_CONTENT_CHARS - len("\n".join(lines + [label, footer]))
-    summary = report.summary if len(report.summary) <= room else report.summary[: room - 1].rstrip() + "…"
-    return "\n".join(lines + [label + summary, footer])
+        fields.append({"name": "Not checked", "value": f"{p['too_far_to_judge']} too far from the camera",
+                       "inline": True})
+    fields += [
+        {"name": "Recommended action", "value": _cut(report.recommended_action, MAX_ACTION_CHARS), "inline": False},
+        {"name": "Photo", "value": escape_markdown(shorten_name(image_name)), "inline": True},
+        {"name": "Analysis", "value": f"#{analysis_id}" if analysis_id is not None else "Not saved to the log",
+         "inline": True},
+    ]
+    embed = {
+        "title": title,
+        "color": COLOURS[report.severity],
+        "description": _cut(report.summary, MAX_SUMMARY_CHARS),
+        "fields": fields,
+        "image": {"url": f"attachment://{IMAGE_FILENAME}"},
+        "footer": {"text": footer_text(report.automated, created_at, PKT)},
+        "timestamp": created_at.isoformat(),
+    }
+    content = f"🚨 {title}: {p['in_violation']} of {workers(p['checked_for_ppe'])} checked missing PPE"
+    return AlertMessage(content, embed)
 
 
 def encode_image(image_bgr: np.ndarray) -> bytes:
@@ -109,10 +119,13 @@ def record(analysis_id: int | None, status: str, error: str | None = None) -> No
         log.warning("Could not record alert status for analysis #%s: %s", analysis_id, type(exc).__name__)
 
 
-def deliver(url: str, analysis_id: int | None, content: str, annotated: np.ndarray) -> str:
+def deliver(url: str, analysis_id: int | None, message: AlertMessage, annotated: np.ndarray) -> str:
     """Background job: send and record the result. Never raises. Returns 'sent' or 'failed'."""
     try:
-        error = send_to_discord(url, content, encode_image(annotated))
+        problems = embed_problems(message.content, [message.embed])
+        if problems:
+            raise ValueError("; ".join(problems))
+        error = send_to_discord(url, message.content, encode_image(annotated), [message.embed])
     except Exception as exc:  # a bug here must still end as a recorded failure
         error = redact(f"{type(exc).__name__}: {exc}", url)[:MAX_ERROR_CHARS]
     status = "sent" if error is None else "failed"
@@ -143,8 +156,8 @@ def alert_after_save(
     if url is None:
         record(analysis_id, "disabled", reason)
         return "disabled", None
-    content = build_message(verdicts, report, analysis_id, image_name, created_at or now_utc())
-    return "sending", _executor.submit(deliver, url, analysis_id, content, annotated)
+    message = build_alert(verdicts, report, analysis_id, image_name, created_at or now_utc())
+    return "sending", _executor.submit(deliver, url, analysis_id, message, annotated)
 
 
 def main() -> None:

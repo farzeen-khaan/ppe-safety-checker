@@ -44,7 +44,10 @@ from src.verdicts import MIN_PERSON_HEIGHT, Detection, PersonVerdict, count_verd
 load_dotenv()  # reads .env into environment variables; real environment variables win
 
 SEVERITIES = ("High", "Medium", "None")
-REPORT_SOURCES = ("gemini", "template")
+REPORT_SOURCES = ("llm", "template")  # since migration 3; the provider has its own column
+# Migration 1 stored the provider's name as the source. Released migrations are history and are
+# never edited, so that value stays here, in migration 1 and in migration 3's rename only.
+_V1_REPORT_SOURCES = ("gemini", "template")
 ALERT_STATUSES = ("not_needed", "pending", "sent", "failed", "disabled")
 DIGEST_STATUSES = ("sent", "failed")
 
@@ -67,7 +70,6 @@ class StorageUnavailable(RuntimeError):
 
 # Numbered schema steps, applied in order and never edited once released.
 # To change the schema later, append a new step (3, 4, ...).
-# Postgres port of the Phase 4 and Phase 7 SQLite steps (see decisions.md, Phase 8a).
 MIGRATIONS: list[tuple[int, str, list[str]]] = [
     (
         1,
@@ -103,7 +105,7 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
                 report_summary     TEXT    NOT NULL,
                 report_action      TEXT    NOT NULL,
                 report_source      TEXT    NOT NULL,
-                report_model       TEXT,               -- which Gemini model wrote it
+                report_model       TEXT,               -- which model wrote it
                 report_error       TEXT,               -- why the template was used
 
                 -- Alert (F7): the only part that changes after the insert
@@ -123,7 +125,7 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
                 CHECK (violation_count = missing_helmet_only_count + missing_vest_only_count
                                          + missing_both_count),
                 CHECK (severity IN {SEVERITIES}),
-                CHECK (report_source IN {REPORT_SOURCES}),
+                CHECK (report_source IN {_V1_REPORT_SOURCES}),
                 CHECK ((report_source = 'gemini'   AND report_model IS NOT NULL AND report_error IS NULL)
                     OR (report_source = 'template' AND report_model IS NULL     AND report_error IS NOT NULL)),
                 CHECK (alert_status IN {ALERT_STATUSES}),
@@ -170,6 +172,35 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
                 CHECK (status IN {DIGEST_STATUSES}),
                 CHECK ((status = 'sent') = (error IS NULL))
             )
+            """,
+        ],
+    ),
+    (
+        3,
+        "Provider-neutral report source, provider in its own column",
+        [
+            "ALTER TABLE analyses ADD COLUMN report_provider TEXT",
+            # The v1 CHECKs on report_source have generated names; find and drop them.
+            """
+            DO $$
+            DECLARE c record;
+            BEGIN
+                FOR c IN SELECT conname FROM pg_constraint
+                         WHERE conrelid = 'analyses'::regclass AND contype = 'c'
+                           AND pg_get_constraintdef(oid) LIKE '%report_source%'
+                LOOP
+                    EXECUTE format('ALTER TABLE analyses DROP CONSTRAINT %I', c.conname);
+                END LOOP;
+            END $$
+            """,
+            "UPDATE analyses SET report_provider = report_source, report_source = 'llm' WHERE report_source <> 'template'",
+            f"ALTER TABLE analyses ADD CONSTRAINT analyses_report_source_check CHECK (report_source IN {REPORT_SOURCES})",
+            """
+            ALTER TABLE analyses ADD CONSTRAINT analyses_report_provenance_check CHECK (
+                   (report_source = 'llm'      AND report_provider IS NOT NULL AND report_model IS NOT NULL
+                                               AND report_error IS NULL)
+                OR (report_source = 'template' AND report_provider IS NULL AND report_model IS NULL
+                                               AND report_error IS NOT NULL))
             """,
         ],
     ),
@@ -370,6 +401,7 @@ def analysis_row(
         "report_summary": report.summary,
         "report_action": report.recommended_action,
         "report_source": report.source,
+        "report_provider": report.provider,
         "report_model": report.model,
         "report_error": report.error if report.source == "template" else None,
         # alerts.py changes 'pending' to 'sent', 'failed' or 'disabled'.

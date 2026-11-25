@@ -20,7 +20,7 @@ from src.violations import PersonVerdict
 FAKE_URL = "https://discord.com/api/webhooks/123456789/SECRET-token_abc"
 T0 = datetime(2026, 11, 5, 13, 4, 0, tzinfo=timezone.utc)  # 18:04 PKT
 IMAGE = np.zeros((100, 200, 3), dtype=np.uint8)
-REPORT = Report("High", "Two workers lack PPE.", "Stop work.", source="gemini", model="gemini-test")
+REPORT = Report("High", "Two workers lack PPE.", "Stop work.", source="llm", provider="acme", model="model-x")
 
 
 def person(has_helmet, has_vest) -> PersonVerdict:
@@ -142,6 +142,9 @@ def test_violation_sends_image_and_message(monkeypatch, enabled):
     payload = json.loads(call["data"]["payload_json"])
     assert payload["allowed_mentions"] == {"parse": []}  # never pings anyone
     assert "High severity" in payload["content"]
+    embed = payload["embeds"][0]
+    assert embed["color"] == alerts.COLOURS["High"]
+    assert embed["image"]["url"] == "attachment://ppe_alert.jpg"  # the uploaded file, shown inside the embed
 
 
 def test_compliant_photo_does_not_alert(monkeypatch, enabled):
@@ -249,26 +252,72 @@ def test_redact_handles_other_hosts():
 
 # --- The message ---
 
-def test_message_contents():
-    text = alerts.build_message(VIOLATION, REPORT, 7, "site_1.jpg", T0)
-    assert "PPE violation — High severity" in text
-    assert "2 of 3 workers checked in violation:** 1 missing helmet, 1 missing helmet and vest." in text
-    assert "1 person could not be checked" in text
-    assert "Two workers lack PPE." in text
-    assert "Analysis #7 · site\\_1.jpg · 05 Nov 2026, 18:04 PKT" in text
+def fields(message) -> dict:
+    return {f["name"]: f["value"] for f in message.embed["fields"]}
 
 
-def test_message_without_too_far_workers_has_no_such_line():
-    text = alerts.build_message([person(False, True)], REPORT, 7, "a.jpg", T0)
-    assert "could not be checked" not in text
-    assert "1 of 1 worker checked in violation:** 1 missing helmet." in text
+def test_alert_embed():
+    m = alerts.build_alert(VIOLATION, REPORT, 7, "site_1.jpg", T0)
+    assert m.content == "🚨 PPE violation — High severity: 2 of 3 workers checked missing PPE"
+    e = m.embed
+    assert (e["title"], e["color"], e["description"]) == ("PPE violation — High severity", 0xD93025, "Two workers lack PPE.")
+    assert fields(m) == {
+        "In violation": "2 of 3 workers checked",
+        "Missing": "1 missing a helmet, 1 missing both helmet and vest",
+        "Not checked": "1 too far from the camera",
+        "Recommended action": "Stop work.",
+        "Photo": r"site\_1.jpg",  # markdown-escaped
+        "Analysis": "#7",
+    }
+    assert e["footer"]["text"] == "Automated summary, check against the figures above · 05 Nov 2026, 18:04 PKT"
+    assert e["timestamp"] == "2026-11-05T13:04:00+00:00"
 
 
-def test_message_stays_within_discords_limit():
-    long_report = Report("High", "x " * 3000, "Stop.", source="gemini", model="m")
-    text = alerts.build_message(VIOLATION, long_report, 7, "n" * 500 + ".jpg", T0)
-    assert len(text) <= alerts.MAX_CONTENT_CHARS
-    assert text.endswith("PKT") and "…" in text  # summary shortened, footer kept
+def test_no_vendor_or_model_name_reaches_the_user():
+    m = alerts.build_alert(VIOLATION, REPORT, 7, "a.jpg", T0)
+    text = json.dumps({"content": m.content, "embed": m.embed}).lower()
+    for hidden in ("acme", "model-x", "llm", "gemini"):
+        assert hidden not in text
+
+
+def test_standard_summary_is_labelled_as_such():
+    standard = Report("High", "S.", "A.", source="template", error="LLM disabled")
+    m = alerts.build_alert(VIOLATION, standard, 7, "a.jpg", T0)
+    assert m.embed["footer"]["text"].startswith("Standard summary, built from the figures above")
+
+
+def test_colour_follows_severity():
+    for severity in ("High", "Medium", "None"):
+        r = Report(severity, "S.", "A.", source="template", error="x")
+        assert alerts.build_alert(VIOLATION, r, 1, "a.jpg", T0).embed["color"] == alerts.COLOURS[severity]
+
+
+def test_no_not_checked_field_without_too_far_workers():
+    m = alerts.build_alert([person(False, True)], REPORT, 7, "a.jpg", T0)
+    assert "Not checked" not in fields(m)
+    assert fields(m)["In violation"] == "1 of 1 worker checked"
+
+
+def test_long_photo_names_keep_their_start_and_extension():
+    m = alerts.build_alert(VIOLATION, REPORT, 7, "source-56088ecf75821c1b93f4015a2bc0a071_extra_long.jpg", T0)
+    photo = fields(m)["Photo"]
+    assert photo.startswith("source-56088ecf") and photo.endswith("ra\\_long.jpg") and "…" in photo
+    assert len(photo.replace("\\", "")) <= 40  # the limit applies before markdown escaping
+
+
+def test_alert_stays_within_discords_embed_limits():
+    long_report = Report("High", "x " * 3000, "y " * 3000, source="llm", provider="acme", model="m")
+    m = alerts.build_alert(VIOLATION, long_report, 7, "n" * 500 + ".jpg", T0)
+    assert alerts.embed_problems(m.content, [m.embed]) == []
+    assert m.embed["description"].endswith("…") and fields(m)["Recommended action"].endswith("…")
+
+
+def test_an_embed_that_breaks_the_limits_is_a_recorded_failure_not_a_send(monkeypatch, enabled):
+    fake = fake_discord(monkeypatch)
+    bad = alerts.AlertMessage("c", {"title": "t" * 300})
+    analysis_id = saved(VIOLATION)
+    assert alerts.deliver(FAKE_URL, analysis_id, bad, IMAGE) == "failed"
+    assert fake.calls == [] and "embed title is 300" in stored(analysis_id)["alert_error"]
 
 
 def test_large_images_are_downscaled():
@@ -313,7 +362,8 @@ def test_pipeline_still_alerts_when_the_save_fails(monkeypatch, enabled):
     monkeypatch.setattr(pipeline, "save_analysis", broken_save)
     result = pipeline.finish_analysis(inspection(VIOLATION), "site.jpg", use_llm=False)
     assert result.save_error and result.alert.result(timeout=10) == "sent"
-    assert "Analysis not saved to the log" in json.loads(fake.calls[0]["data"]["payload_json"])["content"]
+    fields = json.loads(fake.calls[0]["data"]["payload_json"])["embeds"][0]["fields"]
+    assert {"name": "Analysis", "value": "Not saved to the log", "inline": True} in fields
 
 
 def test_dry_run_never_alerts(monkeypatch, enabled):
