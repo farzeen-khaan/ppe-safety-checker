@@ -1,5 +1,5 @@
-# F8 — Daily digest: read the last 24 hours of the incident log (Neon main branch)
-# and post the summary to Discord #daily-digest.
+# F8 — Daily digest: summarise everything in the incident log (Neon main branch) since the
+# last successful digest, and post it to Discord #daily-digest.
 #
 # Repository secrets (Settings → Secrets and variables → Actions → New repository secret):
 #   DATABASE_URL                Neon main branch connection string
@@ -7,21 +7,31 @@
 #                               (GEMINI_API_KEY is still read for one release if LLM_API_KEY is missing)
 #   DISCORD_DIGEST_WEBHOOK_URL  webhook of the #daily-digest channel
 #
+# The window comes from the log, not the clock: from the end of the last successful digest to
+# now. A late run therefore still covers exactly the missing time, and a run that finds nothing
+# new (a successful digest ended under an hour ago) is skipped and recorded as skipped.
 # A non-zero exit from the digest (no webhook, log unreachable, Discord failure) fails the run.
 
 name: Daily digest
 
 on:
   schedule:
-    - cron: "0 13 * * *"  # 13:00 UTC = 18:00 Pakistan time (no daylight saving)
-  workflow_dispatch: {}  # "Run workflow" button in the Actions tab
+    # 13:17 UTC = 18:17 Pakistan time (no daylight saving). Off the top of the hour, when GitHub's
+    # scheduler is busiest; runs still start late, which the window rule above absorbs.
+    - cron: "17 13 * * *"
+  workflow_dispatch:  # "Run workflow" button in the Actions tab
+    inputs:
+      hours:
+        description: "Optional fixed window in hours (blank = since the last successful digest)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
   group: daily-digest
-  cancel-in-progress: false  # never cancel a digest halfway; a second run waits
+  cancel-in-progress: false  # two runs never overlap; never cancel a digest halfway, the second waits
 
 jobs:
   digest:
@@ -44,11 +54,13 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY || secrets.GEMINI_API_KEY }}  # old name: remove next release
           DISCORD_DIGEST_WEBHOOK_URL: ${{ secrets.DISCORD_DIGEST_WEBHOOK_URL }}
+          HOURS: ${{ inputs.hours }}  # via env, never pasted into the script: no shell injection
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            # GitHub can start scheduled runs late. Ending the window at 13:00 UTC today keeps
-            # consecutive daily windows back to back: no gap, no overlap.
-            python -m src.digest --until "$(date -u +%Y-%m-%d)T13:00:00Z"
+          if [ -z "$HOURS" ]; then
+            python -m src.digest
+          elif [[ "$HOURS" =~ ^[0-9]+$ ]]; then
+            python -m src.digest --hours "$HOURS"
           else
-            python -m src.digest  # manual run: the 24 hours ending now
+            echo "hours must be a whole number" >&2
+            exit 2
           fi
