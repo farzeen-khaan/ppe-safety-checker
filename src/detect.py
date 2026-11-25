@@ -1,4 +1,6 @@
-"""F1 — Detection: run the fine-tuned YOLO model on an image.
+"""F1 — Detection with PyTorch (Ultralytics): for training, ONNX export and the parity check only.
+
+The deployed app uses src/onnx_detect.py (same interface, no torch). Needs requirements-dev.txt.
 
 Usage:
     python -m src.detect IMAGE [IMAGE ...] [--conf 0.25] [--out outputs]

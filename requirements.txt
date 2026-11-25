@@ -1,16 +1,25 @@
-# The web app, the pipeline and the tests. The digest needs only the first file.
--r requirements-digest.txt
+# The deployed app (Vercel): FastAPI + ONNX Runtime. No torch, Ultralytics or Gradio.
+# Listed in full (no -r includes) so Vercel's installer needs nothing beyond this file.
+# Training, ONNX export, the parity check and tests: requirements-dev.txt.
 
-# Detection (F1) — pulls in torch and torchvision
-ultralytics==8.4.202
+# API (F6)
+fastapi==0.162.0
+python-multipart==0.0.33
 
-# Image handling (F3)
-opencv-python==5.0.0.93
-pillow==12.3.0
+# Detection (F1) and drawing (F3), CPU only
+onnxruntime==1.32.0
+opencv-python-headless==5.1.0.95
 numpy==2.5.4
 
-# Web UI (F6)
-gradio==6.31.0
+# Incident log (F5): Postgres on Neon
+psycopg[binary]==3.3.8
 
-# Tests
-pytest==9.2.0
+# Summaries (F4, F8)
+google-genai==2.34.0
+pydantic==2.14.2
+
+# Discord (F7, F8)
+requests==2.34.2
+
+# Config
+python-dotenv==1.2.4

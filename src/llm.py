@@ -7,12 +7,10 @@ Each model in models() is tried in turn with a TIMEOUT_MS deadline; if all fail,
 LLMUnavailable is raised and the caller uses its own template. Callers never import the SDK.
 
 Provider: Google Gemini (why: decisions.md, Phase 3). Config: LLM_API_KEY and optional
-LLM_MODEL. GEMINI_API_KEY and GEMINI_MODEL are still read, for one release, if the new
-names are unset.
+LLM_MODEL. (The old GEMINI_API_KEY / GEMINI_MODEL names were removed in Phase 8b.)
 """
 
 import json
-import logging
 import os
 from dataclasses import dataclass
 
@@ -20,7 +18,6 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 load_dotenv()
-log = logging.getLogger(__name__)
 
 PROVIDER = "gemini"
 # Flash-Lite: on the free tier the full Flash models were overloaded or timed out; Lite answers in about 2 s.
@@ -28,10 +25,6 @@ DEFAULT_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest"]
 # Per model. The API rejects deadlines under 10 s, so this is the shortest allowed.
 TIMEOUT_MS = 10_000
 TEMPERATURE = 0.2  # low: summaries should read the same way each time
-
-# Old names, read only when the new ones are unset. Remove after the next release.
-_DEPRECATED = {"LLM_API_KEY": "GEMINI_API_KEY", "LLM_MODEL": "GEMINI_MODEL"}
-_warned: set[str] = set()
 
 
 class LLMUnavailable(RuntimeError):
@@ -46,15 +39,7 @@ class Generated:
 
 
 def _setting(name: str) -> str | None:
-    value = os.environ.get(name, "").strip()
-    if value:
-        return value
-    old = _DEPRECATED[name]
-    value = os.environ.get(old, "").strip()
-    if value and old not in _warned:
-        _warned.add(old)
-        log.warning("%s is deprecated; rename it to %s.", old, name)
-    return value or None
+    return os.environ.get(name, "").strip() or None
 
 
 def api_key() -> str | None:

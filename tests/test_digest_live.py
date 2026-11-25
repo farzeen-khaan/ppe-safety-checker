@@ -14,7 +14,7 @@ from datetime import timedelta
 import pytest
 
 from src import digest, llm, report, storage
-from src.detect import Detection
+from src.verdicts import Detection
 from src.report import Report
 from src.violations import PersonVerdict
 

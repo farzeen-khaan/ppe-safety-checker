@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PPE Safety Checker</title>
+<meta name="description" content="Checks every worker in a construction-site photo for a helmet and a high-visibility vest.">
+<style>
+  :root {
+    --high: #d93025; --medium: #e37400; --none: #188038; --grey: #80868b;
+    --accent: #ea580c; --accent-dark: #c2410c;
+    --text: #1e293b; --muted: #64748b; --border: #e2e8f0; --card: #ffffff; --bg: #f8fafc;
+    --radius: 12px; --gap: 16px;
+    font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); line-height: 1.5; }
+  main { max-width: 1120px; margin: 0 auto; padding: 24px 16px 48px; }
+  header h1 { margin: 0; font-size: 1.7rem; letter-spacing: -0.01em; }
+  header p { margin: 4px 0 0; color: var(--muted); }
+  .legend { font-size: .85rem; color: var(--muted); margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+  .notice { font-size: .85rem; color: var(--muted); background: #fff7ed; border: 1px solid #fed7aa; border-radius: var(--radius);
+            padding: 10px 14px; margin: 16px 0 0; }
+  .layout { display: grid; grid-template-columns: minmax(280px, 2fr) 3fr; gap: 24px; margin-top: 24px; align-items: start; }
+  @media (max-width: 760px) { .layout { grid-template-columns: 1fr; } header h1 { font-size: 1.35rem; } }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; }
+  .card h2, .card h3 { margin: 0 0 10px; font-size: 1.05rem; }
+  label.drop { display: block; border: 2px dashed var(--border); border-radius: var(--radius); padding: 22px 14px; text-align: center;
+               cursor: pointer; color: var(--muted); }
+  label.drop:hover { border-color: var(--accent); }
+  label.drop input { display: none; }
+  #preview { display: none; width: 100%; border-radius: 8px; margin-top: 12px; }
+  button { font: inherit; border: 0; border-radius: 10px; cursor: pointer; }
+  .primary { width: 100%; margin-top: 12px; padding: 12px; background: var(--accent); color: #fff; font-weight: 600; font-size: 1rem; }
+  .primary:hover { background: var(--accent-dark); }
+  .primary:disabled { opacity: .55; cursor: progress; }
+  .status { font-size: .9rem; color: var(--muted); margin-top: 10px; min-height: 1.5em; }
+  .status.error { color: var(--high); }
+  .empty { text-align: center; padding: 56px 20px; border: 1px dashed var(--border); border-radius: var(--radius); color: var(--muted); }
+  .empty strong { display: block; color: var(--text); font-size: 1.05rem; margin-bottom: 6px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; }
+  .badge { display: inline-block; padding: 4px 12px; border-radius: 999px; font-weight: 600; font-size: .875rem; color: #fff; }
+  .sev-High { background: var(--high); } .sev-Medium { background: var(--medium); } .sev-None { background: var(--none); }
+  .badge-grey { background: var(--grey); }
+  .counts { margin: 8px 0 0; }
+  #annotated { width: 100%; border-radius: 8px; margin: 14px 0; display: block; }
+  table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { font-weight: 600; color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .03em; }
+  tbody tr.clickable { cursor: pointer; } tbody tr.clickable:hover { background: #fff7ed; }
+  .table-wrap { overflow-x: auto; }
+  .summary p { margin: 0 0 8px; }
+  .note { margin: 10px 0 0; font-size: .8rem; color: var(--muted); }
+  .bar { height: 10px; border-radius: 6px; margin: 10px 0; background: linear-gradient(90deg, #e2e8f0 25%, #f1f5f9 50%, #e2e8f0 75%);
+         background-size: 200% 100%; animation: shimmer 1.4s infinite; }
+  @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  .stack > * + * { margin-top: var(--gap); }
+  section.history { margin-top: 32px; }
+  .row-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .ghost { padding: 6px 12px; background: #fff; border: 1px solid var(--border); font-size: .875rem; }
+  .muted { color: var(--muted); }
+  @media (max-width: 760px) {  /* History on a phone: the essentials; details on tap */
+    .wide { display: none; }
+    th, td { padding: 8px 5px; }
+    .card.table-wrap { padding: 8px; }
+  }
+  footer { margin-top: 32px; font-size: .8rem; color: var(--muted); }
+  footer a { color: inherit; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>PPE Safety Checker</h1>
+    <p>Checks every worker in a construction-site photo for a helmet and a high-visibility vest.</p>
+    <div class="legend">
+      <span><span class="dot" style="background:var(--none)"></span>Compliant</span>
+      <span><span class="dot" style="background:var(--high)"></span>Violation</span>
+      <span><span class="dot" style="background:var(--grey)"></span>Not checked: smaller than 15% of the photo height</span>
+    </div>
+    <p class="notice"><strong>Demo.</strong> The photo itself is not stored. The result (counts, verdicts, photo name)
+      is saved to a shared log, appears in History for everyone, and may send an alert to a Discord channel.
+      Use site photos without personal details. The first request after a quiet spell can take 10–20 seconds
+      while the server and database wake up. Limit: 10 photos per hour.</p>
+  </header>
+
+  <div class="layout">
+    <div class="card">
+      <h2>Site photo</h2>
+      <label class="drop" id="drop">
+        <input type="file" id="file" accept="image/jpeg,image/png,image/webp">
+        <span id="drop-text">Choose a JPG, PNG or WEBP photo</span>
+      </label>
+      <img id="preview" alt="Selected photo">
+      <button class="primary" id="go" disabled>Analyse</button>
+      <div class="status" id="status" role="status" aria-live="polite"></div>
+    </div>
+
+    <div class="stack" id="result">
+      <div class="empty" id="empty"><strong>No photo analysed yet</strong>
+        Choose a site photo and press Analyse. Verdicts appear here first, then the summary.</div>
+    </div>
+  </div>
+
+  <section class="history">
+    <div class="row-head">
+      <h2>History</h2>
+      <button class="ghost" id="refresh">Refresh</button>
+    </div>
+    <p class="muted" id="history-note">Loading…</p>
+    <div class="card table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Time (PKT)</th><th>Photo</th><th class="wide">People</th><th>In violation</th>
+          <th class="wide">Not checked</th><th>Severity</th><th class="wide">Summary</th><th class="wide">Alert</th></tr></thead>
+        <tbody id="history"></tbody>
+      </table>
+    </div>
+    <div class="stack" id="details" style="margin-top:var(--gap)"></div>
+  </section>
+
+  <footer>API: <a href="/docs">/docs</a> · Detection model fine-tuned from Ultralytics YOLO26n · Summaries are automated: check them against the figures.</footer>
+</main>
+
+<script>
+const MAX_SIDE = 1280;           // resize before upload: small, fast, well under the 4.5 MB limit
+const $ = (id) => document.getElementById(id);
+let selected = null;
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v; else if (k === "text") node.textContent = v; else node.setAttribute(k, v);
+  }
+  for (const c of children) node.append(c);  // strings become text nodes: never parsed as HTML
+  return node;
+}
+
+function setStatus(text, isError = false) {
+  $("status").textContent = text;
+  $("status").className = "status" + (isError ? " error" : "");
+}
+
+async function resized(file) {
+  // createImageBitmap respects the photo's EXIF orientation, so phone photos stay upright.
+  const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+  const scale = Math.min(1, MAX_SIDE / Math.max(bitmap.width, bitmap.height));
+  const canvas = Object.assign(document.createElement("canvas"),
+    { width: Math.round(bitmap.width * scale), height: Math.round(bitmap.height * scale) });
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  const blob = await new Promise((ok) => canvas.toBlob(ok, "image/jpeg", 0.85));
+  const name = file.name.replace(/\.[^.]+$/, "") + ".jpg";
+  return new File([blob], name, { type: "image/jpeg" });
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, options);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    let message = body.detail;
+    if (Array.isArray(message)) message = "The request was not valid.";
+    if (response.status === 413 && !message) message = "The photo is too large. Try a smaller photo.";
+    throw new Error(message || `Something went wrong (HTTP ${response.status}). Try again.`);
+  }
+  return body;
+}
+
+// Same rule as the API's shorten_name: keep the start, the end of the name and the extension.
+function shortName(name, max = 28) {
+  if (name.length <= max) return name;
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 && name.length - dot <= 6 ? name.slice(dot) : "";
+  const stem = name.slice(0, name.length - ext.length), room = max - ext.length - 1, tail = Math.min(8, Math.floor(room / 3));
+  return stem.slice(0, room - tail) + "…" + (tail ? stem.slice(-tail) : "") + ext;
+}
+
+const pkt = (utc) => new Date(utc).toLocaleString("en-GB", { timeZone: "Asia/Karachi", day: "2-digit", month: "short",
+  hour: "2-digit", minute: "2-digit" });
+const readable = (status) => status === "too far to judge" ? "Not checked (too far)" : status[0].toUpperCase() + status.slice(1);
+const ALERTS = { sent: "A Discord alert was sent.", failed: "The Discord alert could not be sent; it is recorded in the log.",
+                 disabled: "Alerts are off, so no Discord alert was sent.", not_needed: "" };
+
+function badges(severity, counts) {
+  const wrap = el("div", { class: "badges" });
+  if (!counts.people) { wrap.append(el("span", { class: "badge badge-grey", text: "No workers detected" })); return wrap; }
+  wrap.append(el("span", { class: `badge sev-${severity}`, text: `Severity: ${severity}` }));
+  if (counts.too_far) wrap.append(el("span", { class: "badge badge-grey", text: `${counts.too_far} not checked` }));
+  return wrap;
+}
+
+function countsLine(c) {
+  if (!c.people) return "Try a closer or clearer photo of the site.";
+  return `${c.people} ${c.people === 1 ? "person" : "people"}: ${c.compliant} compliant, ${c.in_violation} in violation, ` +
+         `${c.too_far} too far to judge`;
+}
+
+function verdictTable(people) {
+  const body = el("tbody");
+  for (const p of people) body.append(el("tr", {}, el("td", { text: p.index }), el("td", { text: readable(p.status) }),
+                                          el("td", { text: p.confidence.toFixed(2) })));
+  return el("div", { class: "table-wrap" }, el("table", {},
+    el("thead", {}, el("tr", {}, el("th", { text: "#" }), el("th", { text: "Verdict" }), el("th", { text: "Confidence" }))), body));
+}
+
+function summaryCard(s) {
+  return el("div", { class: "card summary" }, el("h3", { text: "Summary" }), el("p", { text: s.summary }),
+    el("p", {}, el("strong", { text: "Recommended action: " }), s.recommended_action), el("p", { class: "note", text: s.note }));
+}
+
+const loadingCard = () => el("div", { class: "card", id: "summary" }, el("h3", { text: "Summary" }),
+  el("span", { class: "muted", text: "Writing the summary…" }), el("div", { class: "bar" }), el("div", { class: "bar", style: "width:70%" }));
+
+async function analyse() {
+  if (!selected) return;
+  $("go").disabled = true;
+  setStatus("Checking each worker…");
+  const result = $("result");
+  try {
+    const form = new FormData();
+    form.append("photo", await resized(selected));
+    const a = await api("/api/analyze", { method: "POST", body: form });
+    result.replaceChildren(
+      el("div", { class: "card" }, badges(a.severity, a.counts), el("p", { class: "counts", text: countsLine(a.counts) }),
+        el("img", { id: "annotated", src: a.annotated_jpeg, alt: "Photo with each worker boxed: green compliant, red violation, grey not checked" }),
+        a.people.length ? verdictTable(a.people) : ""),
+      loadingCard());
+    setStatus(`Saved as analysis #${a.id} in ${(a.processing_ms / 1000).toFixed(1)} s. ${ALERTS[a.alert_status] || ""} Writing the summary…`);
+    try {
+      const s = await api(`/api/analyses/${a.id}/summary`, { method: "POST" });
+      $("summary").replaceWith(summaryCard(s));
+      setStatus(`Saved as analysis #${a.id}. ${ALERTS[a.alert_status] || ""}`);
+    } catch (err) {
+      $("summary").replaceWith(el("div", { class: "card" }, el("h3", { text: "Summary" }), el("p", { class: "muted", text: err.message })));
+    }
+    loadHistory();
+  } catch (err) {
+    setStatus(err.message, true);
+  } finally {
+    $("go").disabled = false;
+  }
+}
+
+async function loadHistory() {
+  try {
+    const rows = await api("/api/history?limit=50");
+    $("history-note").textContent = rows.length ? `${rows.length} most recent analyses, newest first. Select a row for details.`
+                                                : "No analyses yet.";
+    $("history").replaceChildren(...rows.map((r) => {
+      const tr = el("tr", { class: "clickable", tabindex: "0" },
+        el("td", { text: r.id }), el("td", { text: pkt(r.created_at) }), el("td", { text: shortName(r.image_name), title: r.image_name }),
+        el("td", { class: "wide", text: r.counts.people }), el("td", { text: r.counts.in_violation }),
+        el("td", { class: "wide", text: r.counts.too_far }),
+        el("td", {}, el("span", { class: `badge sev-${r.severity}`, text: r.severity })), el("td", { class: "wide", text: r.summary }),
+        el("td", { class: "wide", text: r.alert_status === "disabled" ? "not sent (alerts off)" : r.alert_status.replace("_", " ") }));
+      tr.addEventListener("click", () => showDetails(r.id));
+      tr.addEventListener("keydown", (e) => { if (e.key === "Enter") showDetails(r.id); });
+      return tr;
+    }));
+  } catch (err) {
+    $("history-note").textContent = err.message;
+  }
+}
+
+async function showDetails(id) {
+  const box = $("details");
+  box.replaceChildren(el("p", { class: "muted", text: "Loading…" }));
+  try {
+    const d = await api(`/api/analyses/${id}`);
+    box.replaceChildren(
+      el("div", { class: "card" }, el("h3", { text: `Analysis #${d.id} · ${d.image_name} · ${pkt(d.created_at)} PKT` }),
+        badges(d.severity, d.counts), el("p", { class: "counts", text: countsLine(d.counts) }),
+        d.people.length ? verdictTable(d.people) : ""),
+      summaryCard({ summary: d.summary_text, recommended_action: d.recommended_action, note: d.note }));
+    box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } catch (err) {
+    box.replaceChildren(el("p", { class: "muted", text: err.message }));
+  }
+}
+
+$("file").addEventListener("change", (e) => {
+  selected = e.target.files[0] || null;
+  $("go").disabled = !selected;
+  $("drop-text").textContent = selected ? selected.name : "Choose a JPG, PNG or WEBP photo";
+  if (selected) { $("preview").src = URL.createObjectURL(selected); $("preview").style.display = "block"; }
+  setStatus("");
+});
+$("go").addEventListener("click", analyse);
+$("refresh").addEventListener("click", loadHistory);
+loadHistory();
+</script>
+</body>
+</html>

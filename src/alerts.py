@@ -3,15 +3,19 @@
 Usage:
     python -m src.alerts --test     # post one test message, to check the webhook works
 
-The pipeline calls alert_after_save() once an analysis is saved. The send runs on a
-background thread, so the web UI never waits for Discord. The outcome (sent, failed,
-disabled) is written to the analysis's alert status in the incident log.
+The pipeline calls alert_after_save() once an analysis is saved. The send is synchronous:
+on serverless hosting the instance may be frozen as soon as the response is returned, so
+work left on a background thread could never finish. One retry, 429 handling and URL
+redaction are in discord_webhook.send_to_discord. The outcome (sent, failed, disabled) is
+written to the analysis's alert status in the incident log.
+
+The alert goes out before the written summary exists (that is the web app's second call),
+so it carries the rule-based facts: the counts, and the standard summary built from them.
 """
 
 import argparse
 import logging
 import os
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -34,10 +38,6 @@ log = logging.getLogger(__name__)
 MAX_IMAGE_SIDE = 1600  # smaller and faster to upload; boxes stay readable
 MAX_SUMMARY_CHARS = 1500  # well inside the 4096 embed description limit
 MAX_ACTION_CHARS = 1000  # field values are limited to 1024
-
-# One worker: alerts go out one at a time, which suits Discord's per-webhook rate limit.
-# Non-daemon, so a command-line run waits for its alerts before exiting.
-_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="alert")
 
 
 def webhook_config() -> tuple[str | None, str | None]:
@@ -120,7 +120,7 @@ def record(analysis_id: int | None, status: str, error: str | None = None) -> No
 
 
 def deliver(url: str, analysis_id: int | None, message: AlertMessage, annotated: np.ndarray) -> str:
-    """Background job: send and record the result. Never raises. Returns 'sent' or 'failed'."""
+    """Send and record the result. Never raises. Returns 'sent' or 'failed'."""
     try:
         problems = embed_problems(message.content, [message.embed])
         if problems:
@@ -142,22 +142,21 @@ def alert_after_save(
     annotated: np.ndarray,
     image_name: str,
     created_at: datetime | None = None,
-) -> tuple[str, Future | None]:
-    """Start the alert for one analysis, without waiting for it.
+) -> str:
+    """Send the alert for one analysis now, and return its final status.
 
-    Returns (status, future):
-    - ("not_needed", None): nobody is in violation. Too-far-to-judge workers alone never alert.
-    - ("disabled", None):   alerts are switched off or not configured; recorded in the log.
-    - ("sending", future):  sending on the background thread; future.result() is 'sent' or 'failed'.
+    - "not_needed": nobody is in violation. Too-far-to-judge workers alone never alert.
+    - "disabled":   alerts are switched off or not configured; recorded in the log.
+    - "sent" / "failed": the outcome, recorded in the log (at most about 35 s with a retry after a 429).
     """
     if not any(v.is_violation for v in verdicts):
-        return "not_needed", None
+        return "not_needed"
     url, reason = webhook_config()
     if url is None:
         record(analysis_id, "disabled", reason)
-        return "disabled", None
+        return "disabled"
     message = build_alert(verdicts, report, analysis_id, image_name, created_at or now_utc())
-    return "sending", _executor.submit(deliver, url, analysis_id, message, annotated)
+    return deliver(url, analysis_id, message, annotated)
 
 
 def main() -> None:

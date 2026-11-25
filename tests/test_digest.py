@@ -17,7 +17,7 @@ import pytest
 import requests
 
 from src import digest, discord_webhook, llm, report, storage
-from src.detect import Detection
+from src.verdicts import Detection
 from src.report import Report
 from src.violations import PersonVerdict
 

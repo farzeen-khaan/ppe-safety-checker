@@ -1,6 +1,6 @@
 """Unit tests for the F2 violation rules, using hand-made boxes (no model needed)."""
 
-from src.detect import Detection
+from src.verdicts import Detection
 from src.violations import check_people, count_verdicts, overlap_fraction, summary_text
 
 

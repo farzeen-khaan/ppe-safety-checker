@@ -17,7 +17,7 @@ from src import storage  # importing it reads .env, so both URLs are known below
 
 TEST_URL = os.environ.get("DATABASE_URL_TEST", "").strip()
 _APP_URL = os.environ.get("DATABASE_URL", "").strip()  # only compared, never used
-TABLES = "analyses, person_verdicts, digest_runs"
+TABLES = "analyses, person_verdicts, digest_runs, rate_events"
 
 
 def _same_database(a: str, b: str) -> bool:
@@ -36,7 +36,7 @@ def isolate_from_real_services(monkeypatch, request):
     monkeypatch.delenv("DATABASE_URL", raising=False)  # never the app's database, live tests included
     # No real model calls: a test that forgets its fake gets the template, not the API.
     if request.node.get_closest_marker("live") is None:
-        for name in ("LLM_API_KEY", "GEMINI_API_KEY", "LLM_MODEL", "GEMINI_MODEL"):
+        for name in ("LLM_API_KEY", "LLM_MODEL"):
             monkeypatch.delenv(name, raising=False)
 
 
