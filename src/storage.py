@@ -49,7 +49,8 @@ REPORT_SOURCES = ("llm", "template")  # since migration 3; the provider has its 
 # never edited, so that value stays here, in migration 1 and in migration 3's rename only.
 _V1_REPORT_SOURCES = ("gemini", "template")
 ALERT_STATUSES = ("not_needed", "pending", "sent", "failed", "disabled")
-DIGEST_STATUSES = ("sent", "failed")
+DIGEST_STATUSES = ("sent", "failed", "skipped")  # since migration 4
+_V2_DIGEST_STATUSES = ("sent", "failed")  # what migration 2 created; released migrations never change
 
 # Cold starts: a sleeping Neon branch usually wakes in about a second. One attempt may take
 # CONNECT_TIMEOUT_S; the pool retries once after about 1 s (its first backoff step), so a
@@ -169,7 +170,7 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
 
                 CHECK (window_start < window_end),
                 CHECK (analyses_count IS NULL OR analyses_count >= 0),
-                CHECK (status IN {DIGEST_STATUSES}),
+                CHECK (status IN {_V2_DIGEST_STATUSES}),
                 CHECK ((status = 'sent') = (error IS NULL))
             )
             """,
@@ -202,6 +203,29 @@ MIGRATIONS: list[tuple[int, str, list[str]]] = [
                 OR (report_source = 'template' AND report_provider IS NULL AND report_model IS NULL
                                                AND report_error IS NOT NULL))
             """,
+        ],
+    ),
+    (
+        4,
+        "Digest runs can be skipped",
+        [
+            # The v2 status CHECK has a generated name; find and replace it. A skipped run keeps
+            # its reason in `error`, so "error IS NULL exactly when sent" still holds.
+            """
+            DO $$
+            DECLARE c record;
+            BEGIN
+                FOR c IN SELECT conname FROM pg_constraint
+                         WHERE conrelid = 'digest_runs'::regclass AND contype = 'c'
+                           AND pg_get_constraintdef(oid) LIKE '%status = ANY%'
+                LOOP
+                    EXECUTE format('ALTER TABLE digest_runs DROP CONSTRAINT %I', c.conname);
+                END LOOP;
+            END $$
+            """,
+            f"ALTER TABLE digest_runs ADD CONSTRAINT digest_runs_status_check CHECK (status IN {DIGEST_STATUSES})",
+            # Finding the last successful run is the first query of every digest.
+            "CREATE INDEX idx_digest_runs_sent_end ON digest_runs (window_end) WHERE status = 'sent'",
         ],
     ),
 ]
@@ -521,6 +545,13 @@ def get_since(since: datetime, until: datetime | None = None, dsn: str | None = 
 def get_last_24h(now: datetime | None = None, dsn: str | None = None) -> list[dict]:
     now = now or now_utc()
     return get_since(now - timedelta(hours=24), now + timedelta(seconds=1), dsn=dsn)
+
+
+def last_successful_digest_end(dsn: str | None = None) -> datetime | None:
+    """Where the next digest starts: the latest window_end of a sent run. Failed and skipped runs don't count."""
+    with connect(_ensure_db(dsn)) as conn:
+        row = conn.execute("SELECT max(window_end) AS end FROM digest_runs WHERE status = 'sent'").fetchone()
+    return row["end"].astimezone(timezone.utc) if row["end"] else None
 
 
 def list_digest_runs(limit: int = 20, dsn: str | None = None) -> list[dict]:

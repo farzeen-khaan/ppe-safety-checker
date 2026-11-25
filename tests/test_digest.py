@@ -37,7 +37,7 @@ OK, NO_HELMET, NO_VEST, NO_BOTH, FAR = (
 
 
 class FakeLog:
-    """Stands in for storage.get_since and storage.record_digest_run, in memory."""
+    """Stands in for storage.get_since, record_digest_run and last_successful_digest_end, in memory."""
 
     def __init__(self):
         self.rows: list[dict] = []
@@ -62,6 +62,10 @@ class FakeLog:
             "status": status, "analyses_count": analyses_count, "error": error,
         })
 
+    def last_successful_digest_end(self):
+        ends = [r["window_end"] for r in self.runs if r["status"] == "sent"]
+        return datetime.strptime(max(ends), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) if ends else None
+
 
 _log: FakeLog | None = None  # None: the test uses the real log (db fixture)
 
@@ -76,6 +80,7 @@ def log(request, monkeypatch):
     _log = FakeLog()
     monkeypatch.setattr(digest, "get_since", _log.get_since)
     monkeypatch.setattr(digest, "record_digest_run", _log.record_digest_run)
+    monkeypatch.setattr(digest, "last_successful_digest_end", _log.last_successful_digest_end)
     yield _log
     _log = None
 
@@ -161,9 +166,10 @@ def test_aggregation_matches_a_hand_count(a_day):
 
 def test_full_embed(a_day):
     d = digest.build_digest(UNTIL - hours(24), UNTIL, use_llm=False)
-    assert d.content == "📋 Daily PPE digest — 10 Nov 2026: 6 analyses, 7 workers in violation"
+    assert d.content == "📋 PPE digest · 09 Nov 18:00 – 10 Nov 18:00 PKT: 6 analyses, 7 workers in violation"
     e = d.embed
-    assert (e["title"], e["description"]) == ("Daily PPE digest — 10 Nov 2026", "Window: 09 Nov 18:00 – 10 Nov 18:00 PKT")
+    assert e["title"] == "PPE digest · 09 Nov 18:00 – 10 Nov 18:00 PKT"  # the window actually covered
+    assert "description" not in e  # no note when build_digest is called directly
     assert e["color"] == digest.COLOURS["High"]  # the worst severity in the window
     assert fields(d) == {
         "Analyses": "6", "People detected": "14", "Checked": "11", "In violation": "7", "Not checked (too far)": "3",
@@ -216,7 +222,7 @@ def test_window_boundaries(db):
 def test_hours_option_changes_the_window(monkeypatch, capsys, a_day):
     assert digest.main([*UNTIL_ARG, "--hours", "4", "--dry-run", "--no-llm"]) == 0
     out = capsys.readouterr().out
-    assert "**PPE digest, last 4 hours — 10 Nov 2026**\nWindow: 10 Nov 14:00 – 10 Nov 18:00 PKT" in out
+    assert "**PPE digest · 10 Nov 14:00 – 10 Nov 18:00 PKT**\nFixed window: the 4 hours to 10 Nov 18:00 PKT." in out
     assert "**Analyses**\n3\n" in out  # D, F, E; C is 5 h before
 
 
@@ -261,11 +267,12 @@ def test_worst_same_second_uses_the_later_id():
 
 def test_empty_window_message(monkeypatch):
     no_llm(monkeypatch)
-    d = digest.build_digest(UNTIL - hours(24), UNTIL)
-    assert (d.analyses, d.content) == (0, "📋 Daily PPE digest — 10 Nov 2026: no analyses in the last 24 hours")
+    d = digest.build_digest(UNTIL - hours(24), UNTIL, note="Everything since the last digest.")
+    assert (d.analyses, d.content) == (0, "📋 PPE digest · 09 Nov 18:00 – 10 Nov 18:00 PKT: no analyses in this period")
+    assert d.embed["title"] == "PPE digest · 09 Nov 18:00 – 10 Nov 18:00 PKT"
     assert d.embed["description"] == (
-        "Window: 09 Nov 18:00 – 10 Nov 18:00 PKT\n\n"
-        "No analyses in the last 24 hours. The digest ran normally; there was nothing to report."
+        "Everything since the last digest.\n\n"
+        "No analyses in this period. The digest ran normally; there was nothing to report."
     )
     assert d.embed["color"] == digest.GREY and "fields" not in d.embed
     assert d.embed["footer"]["text"] == "10 Nov 2026, 18:00 PKT"  # no summary, so no summary note
@@ -275,7 +282,7 @@ def test_empty_window_is_sent_and_recorded(monkeypatch):
     monkeypatch.setenv("DISCORD_DIGEST_WEBHOOK_URL", DIGEST_URL)
     discord = fake_discord(monkeypatch, response(200))
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 0
-    assert "No analyses in the last 24 hours" in discord.calls[0]["json"]["embeds"][0]["description"]
+    assert "No analyses in this period" in discord.calls[0]["json"]["embeds"][0]["description"]
     run = runs()[0]
     assert (run["status"], run["analyses_count"], run["error"]) == ("sent", 0, None)
 
@@ -451,9 +458,9 @@ def test_sends_one_message_and_records_it(monkeypatch, capsys, a_day):
     discord = fake_discord(monkeypatch, response(200))
     assert digest.main([*UNTIL_ARG, "--no-llm"]) == 0
     assert len(discord.calls) == 1 and discord.urls == [DIGEST_URL]
-    assert discord.calls[0]["json"]["content"].startswith("📋 Daily PPE digest")
-    assert discord.calls[0]["json"]["embeds"][0]["title"] == "Daily PPE digest — 10 Nov 2026"
-    assert "Digest sent: 6 analyses" in capsys.readouterr().out
+    assert discord.calls[0]["json"]["content"].startswith("📋 PPE digest · 09 Nov 18:00 – 10 Nov 18:00 PKT")
+    assert discord.calls[0]["json"]["embeds"][0]["title"] == "PPE digest · 09 Nov 18:00 – 10 Nov 18:00 PKT"
+    assert "Digest sent for 09 Nov 18:00 – 10 Nov 18:00 PKT: 6 analyses" in capsys.readouterr().out
     [run] = runs()
     assert run["window_start"] == "2026-11-09T13:00:00Z" and run["window_end"] == "2026-11-10T13:00:00Z"
     assert (run["status"], run["analyses_count"], run["error"]) == ("sent", 6, None)
@@ -484,7 +491,7 @@ def test_dry_run_sends_and_records_nothing(monkeypatch, capsys, a_day):
     discord = fake_discord(monkeypatch)  # any call would fail: no answers queued
     assert digest.main([*UNTIL_ARG, "--dry-run", "--no-llm"]) == 0
     assert discord.calls == []
-    assert capsys.readouterr().out.startswith("📋 Daily PPE digest")
+    assert capsys.readouterr().out.startswith("📋 PPE digest · ")
     assert runs() == []
 
 
@@ -614,3 +621,181 @@ def test_running_the_digest_never_imports_the_detection_stack():
                             cwd=Path(__file__).resolve().parent.parent, timeout=120, encoding="utf-8")
     assert result.returncode == 0, result.stderr
     assert "HEAVY [] EXIT 0" in result.stdout
+
+
+# --- The window comes from the last successful run, not the clock ---
+# NOW is a late run: the 13:17 UTC schedule started at 00:41 UTC the next day (as run #15 did).
+
+NOW = datetime(2026, 11, 24, 0, 41, 6, tzinfo=timezone.utc)
+
+
+def at(text: str) -> datetime:
+    return datetime.fromisoformat(text).replace(tzinfo=timezone.utc)
+
+
+def past_run(window_end: str, status="sent", window_start: str | None = None):
+    """A run already in the log (FakeLog), newest last."""
+    end = at(window_end)
+    _log.record_digest_run(window_start=at(window_start) if window_start else end - hours(24), window_end=end,
+                           status=status, analyses_count=0, error=None if status == "sent" else "x")
+
+
+def analysis_at(when: str, name: str) -> int:
+    return add([NO_HELMET], UNTIL - at(when), name=name)  # add() measures its offset back from UNTIL
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    monkeypatch.setattr(digest, "now_utc", lambda: NOW)
+    monkeypatch.setenv("DISCORD_DIGEST_WEBHOOK_URL", DIGEST_URL)
+    return NOW
+
+
+def sent_names(discord) -> list[str]:
+    worst = [f["value"] for f in discord.calls[-1]["json"]["embeds"][0].get("fields", []) if f["name"] == "Worst analyses"]
+    return worst[0] if worst else ""
+
+
+# choose_window() on its own: every case, no database
+
+def test_first_ever_run_covers_the_last_24_hours():
+    w = digest.choose_window(NOW, None)
+    assert (w.since, w.until, w.note) == (at("2026-11-23T00:41:06"), NOW, "First digest: the last 24 hours.")
+
+
+def test_late_run_starts_at_the_last_success():
+    w = digest.choose_window(NOW, at("2026-11-22T20:15:00"))
+    assert (w.since, w.until, w.capped_from) == (at("2026-11-22T20:15:00"), NOW, None)
+    assert w.note == "Everything since the last digest."
+
+
+def test_a_missed_day_is_covered_not_lost():
+    last = at("2026-11-21T20:00:00")  # the run of Nov 22 never happened
+    w = digest.choose_window(NOW, last)
+    assert w.since == last and NOW - w.since == timedelta(hours=52, minutes=41, seconds=6)
+
+
+def test_back_to_back_runs_skip():
+    assert digest.choose_window(NOW, NOW - timedelta(minutes=5)) is None
+    assert digest.choose_window(NOW, NOW - digest.MIN_NEW + timedelta(seconds=1)) is None
+    assert digest.choose_window(NOW, NOW - digest.MIN_NEW) is not None  # exactly an hour: not a duplicate
+
+
+def test_a_window_end_in_the_future_skips():
+    """Old runs anchored to '13:00 UTC today' recorded ends after they ran (run #15 ended Nov 24 13:00)."""
+    assert digest.choose_window(NOW, at("2026-11-24T13:00:00")) is None
+
+
+def test_a_long_gap_is_capped_at_72_hours():
+    last = NOW - timedelta(hours=100)
+    w = digest.choose_window(NOW, last)
+    assert (w.since, w.until, w.capped_from) == (NOW - digest.MAX_WINDOW, NOW, last)
+    assert digest.choose_window(NOW, NOW - digest.MAX_WINDOW).capped_from is None  # exactly 72 h: not capped
+
+
+# main(): the same cases end to end (fake log, fake Discord)
+
+def test_late_run_end_to_end(clock, monkeypatch):
+    past_run("2026-11-22T20:15:00")
+    analysis_at("2026-11-22T20:14:59", "already-sent.jpg")
+    analysis_at("2026-11-23T09:00:00", "new.jpg")
+    discord = fake_discord(monkeypatch, response(200))
+    assert digest.main(["--no-llm"]) == 0
+    run = runs()[0]
+    assert (run["window_start"], run["window_end"], run["status"], run["analyses_count"]) == (
+        "2026-11-22T20:15:00Z", "2026-11-24T00:41:06Z", "sent", 1)
+    embed = discord.calls[0]["json"]["embeds"][0]
+    assert embed["title"] == "PPE digest · 23 Nov 01:15 – 24 Nov 05:41 PKT"  # the window actually covered
+    assert "new.jpg" in sent_names(discord) and "already-sent" not in sent_names(discord)
+
+
+def test_missed_day_end_to_end(clock, monkeypatch):
+    past_run("2026-11-21T20:00:00")
+    for when, name in (("2026-11-22T08:00:00", "day1.jpg"), ("2026-11-23T08:00:00", "day2.jpg"),
+                       ("2026-11-23T23:00:00", "day3.jpg")):
+        analysis_at(when, name)
+    discord = fake_discord(monkeypatch, response(200))
+    assert digest.main(["--no-llm"]) == 0
+    assert runs()[0]["analyses_count"] == 3  # nothing from the missed day is lost
+    assert all(n in sent_names(discord) for n in ("day1.jpg", "day2.jpg", "day3.jpg"))
+
+
+def test_back_to_back_runs_send_once(clock, monkeypatch):
+    past_run("2026-11-22T20:15:00")
+    discord = fake_discord(monkeypatch, response(200))
+    assert digest.main(["--no-llm"]) == 0  # the late scheduled run
+    monkeypatch.setattr(digest, "now_utc", lambda: NOW + timedelta(minutes=3))
+    assert digest.main(["--no-llm"]) == 0  # a manual retry three minutes later
+    assert len(discord.calls) == 1  # sent once
+    skipped, sent = runs()[0], runs()[1]
+    assert sent["status"] == "sent"
+    assert (skipped["status"], skipped["analyses_count"]) == ("skipped", None)
+    assert skipped["error"] == "skipped: the last digest already covers up to 24 Nov 05:41 PKT"
+
+
+def test_a_skip_does_not_move_the_next_window(clock, monkeypatch):
+    past_run("2026-11-23T23:50:00")  # 51 minutes before NOW
+    discord = fake_discord(monkeypatch, response(200))
+    assert digest.main(["--no-llm"]) == 0 and discord.calls == []
+    monkeypatch.setattr(digest, "now_utc", lambda: NOW + timedelta(hours=24))
+    assert digest.main(["--no-llm"]) == 0
+    assert runs()[0]["window_start"] == "2026-11-23T23:50:00Z"  # from the last *sent* run, not the skip
+
+
+def test_first_ever_run_end_to_end(clock, monkeypatch):
+    analysis_at("2026-11-22T23:00:00", "too-old.jpg")
+    analysis_at("2026-11-23T12:00:00", "recent.jpg")
+    discord = fake_discord(monkeypatch, response(200))
+    assert digest.main(["--no-llm"]) == 0
+    assert (runs()[0]["window_start"], runs()[0]["analyses_count"]) == ("2026-11-23T00:41:06Z", 1)
+    assert discord.calls[0]["json"]["embeds"][0]["description"] == "First digest: the last 24 hours."
+
+
+def test_72_hour_cap_says_what_it_left_out(clock, monkeypatch):
+    past_run("2026-11-19T20:41:06")  # 100 hours before NOW
+    analysis_at("2026-11-20T10:00:00", "left-out.jpg")  # before the 72-hour start (Nov 21 00:41)
+    analysis_at("2026-11-23T10:00:00", "covered.jpg")
+    discord = fake_discord(monkeypatch, response(200))
+    assert digest.main(["--no-llm"]) == 0
+    assert (runs()[0]["window_start"], runs()[0]["analyses_count"]) == ("2026-11-21T00:41:06Z", 1)
+    assert discord.calls[0]["json"]["embeds"][0]["description"] == (
+        "⚠️ The last digest ended 20 Nov 01:41 PKT, more than 72 hours ago. This one covers only the last "
+        "72 hours; 1 analysis from 20 Nov 01:41 – 21 Nov 05:41 PKT are not included."
+    )
+
+
+def test_failed_previous_run_does_not_move_the_start(clock, monkeypatch):
+    past_run("2026-11-22T20:15:00", status="sent")
+    past_run("2026-11-23T20:30:00", status="failed")  # Discord was down: nothing was delivered
+    analysis_at("2026-11-23T10:00:00", "between.jpg")  # inside the failed run's window
+    discord = fake_discord(monkeypatch, response(200))
+    assert digest.main(["--no-llm"]) == 0
+    assert runs()[0]["window_start"] == "2026-11-22T20:15:00Z"
+    assert "between.jpg" in sent_names(discord)
+
+
+def test_hours_still_overrides_the_automatic_window(clock, monkeypatch):
+    past_run("2026-11-23T23:50:00")  # an automatic run would skip
+    discord = fake_discord(monkeypatch, response(200))
+    assert digest.main(["--hours", "6", "--no-llm"]) == 0
+    assert len(discord.calls) == 1
+    assert (runs()[0]["window_start"], runs()[0]["window_end"]) == ("2026-11-23T18:41:06Z", "2026-11-24T00:41:06Z")
+    assert discord.calls[0]["json"]["embeds"][0]["description"].startswith("Fixed window: the 6 hours to 24 Nov 05:41 PKT.")
+
+
+def test_dry_run_of_a_skip_records_nothing(clock, monkeypatch, capsys):
+    past_run("2026-11-23T23:50:00")
+    before = len(runs())
+    assert digest.main(["--dry-run", "--no-llm"]) == 0
+    assert "Digest skipped" in capsys.readouterr().out and len(runs()) == before
+
+
+def test_the_real_log_finds_the_last_sent_run(db):
+    """Against Postgres: failed and skipped runs never count as coverage; skipped needs a reason."""
+    t = UNTIL
+    storage.record_digest_run(window_start=t - hours(48), window_end=t - hours(24), status="sent", analyses_count=1)
+    storage.record_digest_run(window_start=t - hours(24), window_end=t, status="failed", error="HTTP 503")
+    storage.record_digest_run(window_start=t - hours(1), window_end=t, status="skipped", error="skipped: covered")
+    assert storage.last_successful_digest_end() == t - hours(24)
+    with pytest.raises(storage.psycopg.errors.CheckViolation):
+        storage.record_digest_run(window_start=t - hours(1), window_end=t, status="skipped")  # a skip needs a reason

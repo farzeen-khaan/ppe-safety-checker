@@ -1,10 +1,15 @@
 """F8 — Daily digest: summarise the last 24 hours of the incident log on Discord.
 
 Usage:
-    python -m src.digest                                   # build and send (the last 24 hours)
-    python -m src.digest --hours 6                         # a shorter or longer window
+    python -m src.digest                                   # everything since the last successful digest
+    python -m src.digest --hours 6                         # a fixed window: the last 6 hours
     python -m src.digest --dry-run                         # print only: send nothing, record nothing
-    python -m src.digest --until 2026-11-10T13:00:00Z      # the window ending then (re-runs, tests)
+    python -m src.digest --until 2026-11-10T13:00:00Z      # a fixed 24-hour window ending then (re-runs, tests)
+
+Window: from the end of the last successful (sent) digest to now, so every period is covered
+exactly once however late a scheduled run starts. The first-ever digest covers the last 24
+hours; a gap over 72 hours is capped, and the digest says so. If the last success ended less
+than an hour ago there is nothing new to cover: the run is skipped and recorded as skipped.
 
 Configured from environment variables only (a .env file is read if present). Posts to
 DISCORD_DIGEST_WEBHOOK_URL, or DISCORD_WEBHOOK_URL if that is not set.
@@ -31,11 +36,13 @@ from src.discord_webhook import (
     send_to_discord, shorten_name,
 )
 from src.report import VERIFY, distance_note, pattern, workers
-from src.storage import PKT, get_since, now_utc, record_digest_run
+from src.storage import PKT, get_since, last_successful_digest_end, now_utc, record_digest_run
 
 log = logging.getLogger(__name__)
 
-DEFAULT_HOURS = 24
+DEFAULT_HOURS = 24  # the first-ever digest, and fixed windows without --hours
+MAX_WINDOW = timedelta(hours=72)  # a longer gap is capped (the digest says how much it left out)
+MIN_NEW = timedelta(hours=1)  # less than this since the last success: nothing new, skip
 WORST_COUNT = 3
 MAX_NAME_CHARS = 40
 MAX_SUMMARY_CHARS = 700  # longer model answers are rejected (template instead)
@@ -195,9 +202,45 @@ def pkt(moment: datetime, fmt: str = "%d %b %H:%M") -> str:
     return moment.astimezone(PKT).strftime(fmt)
 
 
-def title(until: datetime, hours: int) -> str:
-    name = "Daily PPE digest" if hours == DEFAULT_HOURS else f"PPE digest, last {hours_text(hours)}"
-    return f"{name} — {pkt(until, '%d %b %Y')}"
+def span(since: datetime, until: datetime) -> str:
+    """'23 Nov 18:17 – 24 Nov 18:17 PKT': the window actually covered."""
+    return f"{pkt(since)} – {pkt(until)} PKT"
+
+
+def title(since: datetime, until: datetime) -> str:
+    return f"PPE digest · {span(since, until)}"
+
+
+@dataclass
+class Window:
+    since: datetime
+    until: datetime
+    note: str  # how the window was chosen, shown in the digest
+    capped_from: datetime | None = None  # the last success's end, when the gap was over MAX_WINDOW
+
+
+def choose_window(now: datetime, last_end: datetime | None) -> Window | None:
+    """The automatic window, from the end of the last sent digest to now. None: nothing new, skip.
+
+    Pure (no database), so every case is tested directly.
+    """
+    until = now.replace(microsecond=0)
+    if last_end is None:
+        return Window(until - timedelta(hours=DEFAULT_HOURS), until, "First digest: the last 24 hours.")
+    if until - last_end < MIN_NEW:
+        return None
+    if until - last_end > MAX_WINDOW:
+        return Window(until - MAX_WINDOW, until, "", capped_from=last_end)
+    return Window(last_end, until, "Everything since the last digest.")
+
+
+def capped_note(window: Window, left_out: int) -> str:
+    analyses = "1 analysis" if left_out == 1 else f"{left_out} analyses"
+    return (
+        f"⚠️ The last digest ended {pkt(window.capped_from)} PKT, more than 72 hours ago. "
+        f"This one covers only the last 72 hours; {analyses} from {span(window.capped_from, window.since)} "
+        "are not included."
+    )
 
 
 def worst_line(rank: int, r: dict) -> str:
@@ -227,22 +270,22 @@ class Digest:
     automated: bool  # the summary was written by the model
 
 
-def empty_digest(since: datetime, until: datetime, hours: int) -> Digest:
+def empty_digest(since: datetime, until: datetime, note: str) -> Digest:
     embed = {
-        "title": title(until, hours),
+        "title": title(since, until),
         "color": GREY,
         "description": (
-            f"Window: {pkt(since)} – {pkt(until)} PKT\n\n"
-            f"No analyses in the last {hours_text(hours)}. The digest ran normally; there was nothing to report."
+            (note + "\n\n" if note else "")
+            + "No analyses in this period. The digest ran normally; there was nothing to report."
         ),
         "footer": {"text": footer_time(until, PKT)},
         "timestamp": until.isoformat(),
     }
-    return Digest(f"📋 {title(until, hours)}: no analyses in the last {hours_text(hours)}", embed, 0, False)
+    return Digest(f"📋 {title(since, until)}: no analyses in this period", embed, 0, False)
 
 
 def build_embed(
-    stats: dict, worst: list[dict], summary: str, automated: bool, since: datetime, until: datetime, hours: int
+    stats: dict, worst: list[dict], summary: str, automated: bool, since: datetime, until: datetime, note: str = ""
 ) -> dict:
     s = stats
     fields = [
@@ -267,25 +310,24 @@ def build_embed(
          "value": f"Alerts: {alerts}\nSummaries: {s['summaries_automated']} automated, {s['summaries_standard']} standard"},
     ]
     return {
-        "title": title(until, hours),
+        "title": title(since, until),
         "color": colour(s),
-        "description": f"Window: {pkt(since)} – {pkt(until)} PKT",
         "fields": fields,
         "footer": {"text": footer_text(automated, until, PKT)},
         "timestamp": until.isoformat(),
-    }
+    } | ({"description": note} if note else {})
 
 
-def build_digest(since: datetime, until: datetime, hours: int = DEFAULT_HOURS, use_llm: bool = True) -> Digest:
+def build_digest(since: datetime, until: datetime, use_llm: bool = True, note: str = "") -> Digest:
     """The complete digest for since <= created_at < until. Raises if the log can't be read."""
     rows = get_since(since, until)  # half-open: consecutive digests never overlap
     if not rows:
-        return empty_digest(since, until, hours)
+        return empty_digest(since, until, note)
     stats = summarise(rows)
     summary, automated = write_summary(stats, use_llm=use_llm)
-    embed = build_embed(stats, worst_analyses(rows), summary, automated, since, until, hours)
+    embed = build_embed(stats, worst_analyses(rows), summary, automated, since, until, note)
     analyses = "1 analysis" if stats["analyses"] == 1 else f"{stats['analyses']} analyses"
-    content = f"📋 {title(until, hours)}: {analyses}, {workers(stats['in_violation'])} in violation"
+    content = f"📋 {title(since, until)}: {analyses}, {workers(stats['in_violation'])} in violation"
     return Digest(content, embed, len(rows), automated)
 
 
@@ -324,16 +366,19 @@ def save_run(since: datetime, until: datetime, status: str, analyses: int | None
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Send the PPE digest for the last N hours to Discord.")
-    parser.add_argument("--hours", type=positive_int, default=DEFAULT_HOURS, help="window length (default 24)")
-    parser.add_argument("--until", type=parse_until, help="end of the window, with a time zone (default: now)")
+    parser = argparse.ArgumentParser(description="Send the PPE digest to Discord.")
+    parser.add_argument("--hours", type=positive_int,
+                        help="a fixed window: the last N hours (default: since the last successful digest)")
+    parser.add_argument("--until", type=parse_until,
+                        help="end of a fixed window, with a time zone (implies --hours 24 if --hours is not given)")
     parser.add_argument("--dry-run", action="store_true", help="print the digest; send and record nothing")
     parser.add_argument("--no-llm", action="store_true", help="use the standard summary only")
     args = parser.parse_args(argv)
 
-    until = args.until or now_utc()
-    since = until - timedelta(hours=args.hours)
+    now = (args.until or now_utc()).replace(microsecond=0)
+    fixed = args.hours is not None or args.until is not None
     url = None if args.dry_run else digest_webhook_url()
+    since, until = now - timedelta(hours=args.hours or DEFAULT_HOURS), now  # replaced below for automatic runs
 
     if not args.dry_run and url is None:  # fail in seconds, before any work
         print(f"Digest not sent: {NO_WEBHOOK}.", file=sys.stderr)
@@ -342,7 +387,22 @@ def main(argv: list[str] | None = None) -> int:
 
     analyses = None
     try:
-        digest = build_digest(since, until, args.hours, use_llm=not args.no_llm)
+        if fixed:
+            note = f"Fixed window: the {hours_text(args.hours or DEFAULT_HOURS)} to {pkt(until)} PKT."
+        else:
+            last_end = last_successful_digest_end()
+            window = choose_window(now, last_end)
+            if window is None:  # a successful run already covers up to now
+                reason = f"skipped: the last digest already covers up to {pkt(last_end)} PKT"
+                print(f"Digest {reason}.")
+                if not args.dry_run:
+                    save_run(min(last_end, now - timedelta(seconds=1)), now, "skipped", None, reason)
+                return 0
+            since, until = window.since, window.until
+            note = window.note
+            if window.capped_from is not None:
+                note = capped_note(window, len(get_since(window.capped_from, window.since)))
+        digest = build_digest(since, until, use_llm=not args.no_llm, note=note)
         analyses = digest.analyses
         problems = embed_problems(digest.content, [digest.embed])
         if problems:  # never cut: a truncated digest is a partial digest
@@ -359,11 +419,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if error:
         print(f"Digest not sent: {error}", file=sys.stderr)
-        save_run(since, until, "failed", analyses, error)
+        save_run(since, until, "failed", analyses, error)  # a failed run never moves the next window's start
         return 1
     save_run(since, until, "sent", analyses, None)
     kind = "empty window" if not analyses else "automated summary" if digest.automated else "standard summary"
-    print(f"Digest sent: {analyses} analyses, {kind}.")
+    print(f"Digest sent for {span(since, until)}: {analyses} analyses, {kind}.")
     return 0
 
 

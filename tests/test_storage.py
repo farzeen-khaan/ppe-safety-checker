@@ -73,7 +73,7 @@ def test_init_is_idempotent_and_records_migrations(db):
         tables = {r["table_name"] for r in conn.execute(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()"
         )}
-    assert versions(db) == [1, 2, 3]
+    assert versions(db) == [1, 2, 3, 4]
     assert {"analyses", "person_verdicts", "digest_runs", "schema_migrations"} <= tables
 
 
@@ -93,7 +93,7 @@ def test_existing_version_1_log_is_upgraded(fresh):
             (T0,),
         ).fetchone()["id"]
     storage.init_db(fresh)
-    assert versions(fresh) == [1, 2, 3]
+    assert versions(fresh) == [1, 2, 3, 4]
     assert storage.get_analysis(old_id)["image_name"] == "old.jpg"
     assert storage.list_digest_runs() == []
 
@@ -125,7 +125,7 @@ def test_processes_starting_together_migrate_once(fresh):
         t.start()
     for t in threads:
         t.join()
-    assert failures == [] and versions(fresh) == [1, 2, 3]
+    assert failures == [] and versions(fresh) == [1, 2, 3, 4]
 
 
 # --- Round trip ---
@@ -428,3 +428,19 @@ def test_migration_3_moves_the_provider_into_its_own_column(fresh):
     )
     with pytest.raises(errors.CheckViolation):  # the new rule holds for new rows too
         insert_raw(fresh, report_provider=None)
+
+
+def test_migration_4_allows_skipped_runs_and_keeps_old_ones(fresh):
+    storage.init_db(fresh, migrations=storage.MIGRATIONS[:3])
+    insert = ("INSERT INTO digest_runs (ran_at, window_start, window_end, status, error)"
+              " VALUES (%s, %s, %s, %s, %s)")  # raw SQL: record_digest_run would migrate first
+    with storage.connect(fresh) as conn:
+        with pytest.raises(errors.CheckViolation):  # before migration 4, skipped was not a status
+            conn.execute(insert, (T0, T0 - timedelta(hours=1), T0, "skipped", "r"))
+        conn.execute(insert, (T0, T0 - timedelta(hours=24), T0, "sent", None))
+    storage.init_db(fresh)
+    assert versions(fresh) == [1, 2, 3, 4]
+    storage.record_digest_run(window_start=T0, window_end=T0 + timedelta(hours=1), status="skipped",
+                              error="skipped: covered", dsn=fresh)
+    assert [r["status"] for r in storage.list_digest_runs(dsn=fresh)] == ["skipped", "sent"]
+    assert storage.last_successful_digest_end(dsn=fresh) == T0
