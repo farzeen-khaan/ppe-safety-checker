@@ -12,6 +12,7 @@ Every request is independent: nothing is kept between requests except the loaded
 
 import base64
 import hashlib
+import os
 from datetime import timedelta
 from pathlib import Path
 
@@ -33,6 +34,7 @@ MAX_IMAGE_SIDE = 1280  # the annotated JPEG returned; the page resizes uploads t
 ANALYZE_LIMIT, SUMMARY_LIMIT = 10, 30  # per client per hour: a public demo, the model API and alerts cost
 RATE_WINDOW = timedelta(hours=1)
 RETRY_AFTER_DB_S = 5  # a Neon branch waking up usually answers within seconds
+MIN_SALT_CHARS = 32  # RATE_LIMIT_SALT: e.g. python -c "import secrets; print(secrets.token_hex(32))"
 PAGE = Path(__file__).resolve().parent / "web" / "index.html"
 
 app = FastAPI(
@@ -108,6 +110,15 @@ class RateLimited(Exception):
         self.retry_after = retry_after
 
 
+class NotConfigured(RuntimeError):
+    """A required setting is missing. The message names the setting, never a value."""
+
+
+@app.exception_handler(NotConfigured)
+async def not_configured(request: Request, exc: NotConfigured) -> JSONResponse:
+    return JSONResponse({"detail": f"The server is not configured correctly: {exc}."}, status_code=500)
+
+
 @app.exception_handler(StorageUnavailable)
 async def database_waking(request: Request, exc: StorageUnavailable) -> JSONResponse:
     return JSONResponse(
@@ -127,17 +138,23 @@ async def rate_limited(request: Request, exc: RateLimited) -> JSONResponse:
 
 # --- Helpers ---
 
+def rate_limit_salt() -> str:
+    """RATE_LIMIT_SALT, a secret environment variable (never in code). Refuses to run without a long one."""
+    salt = os.environ.get("RATE_LIMIT_SALT", "").strip()
+    if len(salt) < MIN_SALT_CHARS:
+        raise NotConfigured(f"RATE_LIMIT_SALT is not set or shorter than {MIN_SALT_CHARS} characters")
+    return salt
+
+
 def client_key(request: Request) -> str:
     """A salted hash of the client's IP: enough to rate-limit, never stored as the IP itself.
 
-    Vercel puts the client's public IP in x-real-ip and x-forwarded-for. The salt is derived from
-    DATABASE_URL (already a secret), so no extra setting is needed and the hashes can't be
-    reversed by trying every IPv4 address without it.
+    Vercel puts the client's public IP in x-real-ip and x-forwarded-for. Without the secret salt
+    the hashes can't be reversed by hashing every IPv4 address.
     """
     ip = (request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for", "").split(",")[0]
           or (request.client.host if request.client else "unknown")).strip()
-    salt = hashlib.sha256(storage.database_url().encode()).hexdigest()
-    return hashlib.sha256(f"{salt}:{ip}".encode()).hexdigest()
+    return hashlib.sha256(f"{rate_limit_salt()}:{ip}".encode()).hexdigest()
 
 
 def check_rate(bucket: str, limit: int, request: Request) -> None:

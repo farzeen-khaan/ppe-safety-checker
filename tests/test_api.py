@@ -50,10 +50,13 @@ ROW = {
 }
 
 
+TEST_SALT = "test-salt-" + "x" * 32  # tests only; the real one is a secret env var
+
+
 @pytest.fixture
 def client(monkeypatch):
-    """The app with every storage call faked (rate limit open) and a fake database URL for the IP salt."""
-    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@db.invalid/neondb")
+    """The app with every storage call faked (rate limit open) and a test salt."""
+    monkeypatch.setenv("RATE_LIMIT_SALT", TEST_SALT)
     monkeypatch.setattr(storage, "rate_limit", lambda bucket, client, limit, window: None)
     return TestClient(web.app)
 
@@ -256,12 +259,41 @@ def test_client_key_is_a_salted_hash_of_the_real_ip(client, analyzed, monkeypatc
     assert seen[0] != hashlib.sha256(b"203.0.113.7").hexdigest()  # salted: not reversible by hashing every IPv4
 
 
+def test_a_different_salt_gives_different_keys(client, analyzed, monkeypatch):
+    seen = []
+    monkeypatch.setattr(storage, "rate_limit", lambda bucket, key, limit, window: seen.append(key))
+    upload(client, headers={"x-real-ip": "203.0.113.7"})
+    monkeypatch.setenv("RATE_LIMIT_SALT", "another-salt-" + "y" * 32)
+    upload(client, headers={"x-real-ip": "203.0.113.7"})
+    assert seen[0] != seen[1]
+
+
+@pytest.mark.parametrize("salt", [None, "", "too-short"])
+def test_without_a_proper_salt_the_api_refuses_instead_of_hashing_weakly(client, analyzed, monkeypatch, salt):
+    if salt is None:
+        monkeypatch.delenv("RATE_LIMIT_SALT", raising=False)
+    else:
+        monkeypatch.setenv("RATE_LIMIT_SALT", salt)
+    r = upload(client)
+    assert r.status_code == 500
+    assert r.json()["detail"] == ("The server is not configured correctly: RATE_LIMIT_SALT is not set or "
+                                  "shorter than 32 characters.")
+    assert analyzed == []  # refused before the model runs
+
+
+def test_the_salt_is_not_in_the_code():
+    source = (Path(web.__file__)).read_text(encoding="utf-8")
+    assert "database_url()" not in source.split("def rate_limit_salt")[1].split("def client_key")[0]
+    assert 'os.environ.get("RATE_LIMIT_SALT"' in source
+
+
 # --- End to end: real ONNX model and the real log (test branch); language model and Discord faked ---
 
 @pytest.mark.skipif(not PHOTO.exists(), reason="the dataset (data/) is not downloaded")
 def test_full_flow_on_the_test_branch(db, monkeypatch):
     sent = []
     monkeypatch.setenv("ALERTS_ENABLED", "true")
+    monkeypatch.setenv("RATE_LIMIT_SALT", TEST_SALT)
     monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1/fake")
     monkeypatch.setattr("src.alerts.send_to_discord", lambda url, content, jpg, embeds: sent.append(embeds) or None)
     monkeypatch.setattr(llm, "generate", lambda prompt, facts, schema: llm.Generated(
