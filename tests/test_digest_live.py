@@ -1,4 +1,4 @@
-"""Live tests for F8: the real Gemini API and the real digest webhook. Skipped unless RUN_LIVE_TESTS=1.
+"""Live tests for F8: the real model API and the real digest webhook. Skipped unless RUN_LIVE_TESTS=1.
 
     $env:RUN_LIVE_TESTS = "1"; python -m pytest -m live      # PowerShell
 
@@ -7,12 +7,13 @@ to the channel in DISCORD_DIGEST_WEBHOOK_URL (or DISCORD_WEBHOOK_URL). It is lab
 as a test so nobody mistakes it for a real day.
 """
 
+import json
 import os
 from datetime import timedelta
 
 import pytest
 
-from src import digest, report, storage
+from src import digest, llm, report, storage
 from src.detect import Detection
 from src.report import Report
 from src.violations import PersonVerdict
@@ -25,19 +26,19 @@ pytestmark = [
 ROW = {
     "people_count": 4, "too_far_count": 1, "compliant_count": 1, "violation_count": 2,
     "missing_helmet_only_count": 1, "missing_vest_only_count": 0, "missing_both_count": 1,
-    "severity": "High", "report_source": "gemini", "alert_status": "sent",
+    "severity": "High", "report_source": "llm", "alert_status": "sent",
 }
 
 
-def test_real_gemini_writes_an_overview():
-    facts = digest.overview_facts(digest.summarise([ROW]))
-    for model in report.gemini_models():
+def test_every_model_accepts_the_digest_summary_request():
+    text = digest.SUMMARY_PROMPT.format(facts=json.dumps(digest.summary_facts(digest.summarise([ROW]))))
+    for model in llm.models():
         try:
-            answer = report.ask_gemini(facts, model, digest.OVERVIEW_PROMPT, digest.Overview)
+            answer = llm._call(text, digest.DigestSummary, model)
         except Exception as exc:
             assert "400" not in str(exc), f"{model} rejected our request: {exc}"
             continue  # overloaded or rate-limited: the service's state, not our bug
-        assert 0 < len(answer.overview) <= digest.MAX_OVERVIEW_CHARS
+        assert 0 < len(answer.summary) <= digest.MAX_SUMMARY_CHARS
 
 
 def test_real_digest_is_posted(db):
@@ -54,7 +55,7 @@ def test_real_digest_is_posted(db):
             model_version="live-test", conf_threshold=0.25, processing_ms=1, created_at=now - timedelta(minutes=5),
         )
     built = digest.build_digest(now - timedelta(hours=24), now, use_llm=False)
-    message = "🧪 **Automated live test with sample data, please ignore.**\n" + built.message
-    assert built.analyses == 2 and len(message) <= digest.MAX_CONTENT_CHARS
-    error = digest.send_to_discord(url, message)
+    content = "🧪 Automated live test with sample data, please ignore. " + built.content
+    assert built.analyses == 2 and digest.embed_problems(content, [built.embed]) == []
+    error = digest.send_to_discord(url, content, embeds=[built.embed])
     assert error is None, error  # already redacted, so the URL never shows in the output

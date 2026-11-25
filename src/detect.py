@@ -20,7 +20,7 @@ from ultralytics import YOLO
 from src.verdicts import Detection  # noqa: F401  (re-exported: src.detect.Detection)
 
 MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "best.pt"
-# Chosen in Phase 2: with the too-far cut-off, 0.25 had the fewest silent misses and false alarms.
+# With the too-far cut-off, 0.25 had the fewest silent misses and false alarms (decisions.md).
 DEFAULT_CONF = 0.25
 
 
@@ -63,10 +63,7 @@ def detect(image: np.ndarray, conf: float = DEFAULT_CONF) -> list[Detection]:
 
 
 def draw_detections(image: np.ndarray, detections: list[Detection]) -> np.ndarray:
-    """Return a copy of the image with every box and its label drawn on it.
-
-    This is a raw debug view of the model output. Per-person green/red verdicts come in F3.
-    """
+    """A copy of the image with every raw model box and label. A debug view; the app uses draw_verdicts."""
     annotated = image.copy()
     for d in detections:
         # Red for missing-PPE classes, blue for everything else (colours are BGR).

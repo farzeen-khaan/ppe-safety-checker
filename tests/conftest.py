@@ -34,6 +34,10 @@ def isolate_from_real_services(monkeypatch, request):
         monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
         monkeypatch.delenv("DISCORD_DIGEST_WEBHOOK_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)  # never the app's database, live tests included
+    # No real model calls: a test that forgets its fake gets the template, not the API.
+    if request.node.get_closest_marker("live") is None:
+        for name in ("LLM_API_KEY", "GEMINI_API_KEY", "LLM_MODEL", "GEMINI_MODEL"):
+            monkeypatch.delenv(name, raising=False)
 
 
 _cleaned_at_start = False

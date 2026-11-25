@@ -37,13 +37,43 @@ def test_read_image_without_upload():
         app.read_image(None)
 
 
-def test_no_people_message():
-    assert "No workers detected" in app.summary_markdown([])
+def test_no_people_badge():
+    html = app.badge_html([], "None")
+    assert "No workers detected" in html and "badge-grey" in html
 
 
-def test_verdict_rows():
-    v = PersonVerdict(Detection(5, "Person", 0.912, 0, 0, 10, 30), has_helmet=False, has_vest=True)
-    assert app.verdict_rows([v]) == [[1, "missing helmet", "0.91"]]
+def test_verdict_rows_are_readable():
+    vs = [PersonVerdict(Detection(5, "Person", 0.912, 0, 0, 10, 30), has_helmet=False, has_vest=True),
+          PersonVerdict(Detection(5, "Person", 0.5, 0, 0, 10, 30), has_helmet=None, has_vest=None)]
+    assert app.verdict_rows(vs) == [[1, "Missing helmet", "0.91"], [2, "Not checked (too far)", "0.50"]]
+
+
+@pytest.mark.parametrize("severity", ["High", "Medium", "None"])
+def test_severity_badge_colour(severity):
+    assert f'class="badge sev-{severity}">Severity: {severity}<' in app.severity_badge(severity)
+
+
+def test_badge_shows_not_checked_in_grey():
+    far = PersonVerdict(Detection(5, "Person", 0.9, 0, 0, 10, 30), None, None)
+    no_helmet = PersonVerdict(Detection(5, "Person", 0.9, 0, 0, 10, 30), False, True)
+    html = app.badge_html([no_helmet, far, far], "Medium")
+    assert "sev-Medium" in html and '<span class="badge badge-grey">2 not checked</span>' in html
+    assert "3 people: 0 compliant, 1 in violation, 2 too far to judge" in html
+
+
+def test_summary_card_discloses_automation_without_naming_the_model():
+    gemini = Report("High", "S.", "A.", source="llm", provider="acme", model="model-x")
+    card = app.report_card(gemini)
+    assert "<h3>Summary</h3>" in card and "Automated summary, check against the figures above." in card
+    for hidden in ("acme", "model-x", "gemini", "LLM", "Written by"):
+        assert hidden not in card
+    standard = app.report_card(Report("High", "S.", "A.", source="template", error="503"))
+    assert "Standard summary, built from the figures above." in standard and "503" not in standard
+
+
+def test_summary_card_escapes_html():
+    card = app.summary_card("<script>alert(1)</script>", "a & b", automated=True)
+    assert "<script>" not in card and "&lt;script&gt;" in card and "a &amp; b" in card
 
 
 def test_to_pkt_adds_five_hours():
@@ -51,12 +81,15 @@ def test_to_pkt_adds_five_hours():
     assert app.to_pkt("2026-11-05T20:30:00Z") == "2026-11-06 01:30"  # crosses midnight
 
 
-def test_report_markdown_names_its_source():
-    gemini = Report("High", "S.", "A.", source="gemini", model="gemini-x")
-    fallback = Report("High", "S.", "A.", source="template", error="503")
-    assert "Written by gemini-x" in app.report_markdown(gemini)
-    assert "Gemini was unavailable" in app.report_markdown(fallback)
-    assert "severity: High" in app.report_markdown(gemini)
+def test_history_shows_summary_kind_not_the_model():
+    row = {"id": 7, "created_at": "2026-11-05T13:00:00Z", "image_name": "source-56088ecf75821c1b93f4015a2bc0a071.jpg",
+           "people_count": 3, "compliant_count": 1, "violation_count": 1, "too_far_count": 1, "severity": "High",
+           "report_source": "llm", "report_provider": "acme", "report_model": "model-x", "alert_status": "sent"}
+    [cells] = app.history_rows([row])
+    assert cells[8] == "automated" and "model-x" not in cells and "acme" not in cells
+    assert cells[2].startswith("source-") and cells[2].endswith("2bc0a071.jpg") and "…" in cells[2]
+    assert len(cells[2]) <= 32
+    assert app.history_rows([row | {"report_source": "template"}])[0][8] == "standard"
 
 
 def test_show_details_for_a_clicked_history_row(monkeypatch):
@@ -64,16 +97,17 @@ def test_show_details_for_a_clicked_history_row(monkeypatch):
 
     fake = {
         "id": 7, "image_name": "site.jpg", "created_at": "2026-11-05T13:00:00Z", "severity": "Medium",
-        "report_summary": "S.", "report_action": "A.", "report_model": None, "alert_status": "pending",
-        "conf_threshold": 0.25, "processing_ms": 1500,
-        "people": [{"person_index": 1, "status": "missing vest", "confidence": 0.88}],
+        "report_summary": "S.", "report_action": "A.", "report_source": "llm", "report_provider": "acme",
+        "report_model": "model-x", "alert_status": "pending", "conf_threshold": 0.25, "processing_ms": 1500,
+        "people": [{"person_index": 1, "status": "missing vest", "confidence": 0.88, "has_helmet": True}],
     }
     monkeypatch.setattr(app, "get_analysis", lambda analysis_id: fake if analysis_id == 7 else None)
 
     text, people = app.show_details(SimpleNamespace(row_value=[7, "2026-11-05 18:00"]))
-    assert "Analysis #7" in text and "18:00 PKT" in text and "Report by template" in text
-    assert people == [[1, "missing vest", "0.88"]]
-    assert app.show_details(SimpleNamespace(row_value=[8]))[0] == "That analysis no longer exists."
+    assert "Analysis #7" in text and "18:00 PKT" in text and "sev-Medium" in text
+    assert "Automated summary" in text and "model-x" not in text and "acme" not in text
+    assert people == [[1, "Missing vest", "0.88"]]
+    assert app.show_details(SimpleNamespace(row_value=[8]))[0] == "<p>That analysis no longer exists.</p>"
 
 
 def test_history_says_so_when_the_log_is_unreachable(monkeypatch):

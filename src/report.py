@@ -1,37 +1,23 @@
-"""F4 — Incident report: severity by rules, wording by Gemini, template as fallback.
+"""F4 — Incident report: severity by rules, wording by a language model, template as fallback.
 
 Usage:
     python -m src.report IMAGE [--conf 0.25] [--no-llm]
 
-Only the structured verdict counts are sent to Gemini, never the image.
-Severity is computed here by rules; the LLM only writes the summary and the action.
-If Gemini fails for any reason (no key, timeout, quota, bad output), a template report is used.
+Only counts go to the model, never the image. Severity comes from rules; the model only
+writes the summary and the recommended action. Any model failure gives the template.
 """
 
 import argparse
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import load_dotenv
 from pydantic import BaseModel
 
-# Light imports only: the digest imports this module and must not load torch or OpenCV.
-# main() imports the detection model itself.
-from src.verdicts import PersonVerdict, count_verdicts
+from src import llm
+from src.verdicts import PersonVerdict, count_verdicts  # light: the digest imports this module
 
-load_dotenv()  # reads .env into environment variables; real environment variables win
-
-# Models tried in order; then the template. Measured Nov 5, 2026 on the free tier: full Flash
-# models returned 503 (overloaded) or timed out after ~29 s; Flash-Lite models answered in ~2 s.
-# A Lite model is plenty for turning a few counts into three sentences.
-DEFAULT_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest"]
-# Per model. The Gemini API rejects deadlines under 10 s (400 INVALID_ARGUMENT), so 10 s is
-# the shortest allowed. Measured over 24 calls: median success 2 s, 11 of 12 under 6 s, and
-# failures (503 overloaded, 429 rate limit) usually arrive within 2 s.
-LLM_TIMEOUT_MS = 10_000
-MAX_FIELD_CHARS = 800  # reject runaway answers
+MAX_FIELD_CHARS = 800  # longer answers are treated as failures
 
 
 @dataclass
@@ -39,23 +25,23 @@ class Report:
     severity: str  # "High", "Medium" or "None"
     summary: str
     recommended_action: str
-    source: str  # "gemini" or "template"
-    model: str | None = None  # which Gemini model wrote it
-    error: str | None = None  # why the template was used, if it was
+    source: str  # "llm" (automated) or "template" (standard)
+    provider: str | None = None  # set when source is "llm"; kept in the log, never shown to users
+    model: str | None = None
+    error: str | None = None  # why the template was used
+
+    @property
+    def automated(self) -> bool:
+        return self.source == "llm"
 
 
 class LLMReport(BaseModel):
-    """The exact shape we ask Gemini to return."""
-
     summary: str
     recommended_action: str
 
 
 def compute_severity(verdicts: list[PersonVerdict]) -> str:
-    """PRD rule: High = 3+ people in violation or anyone missing both items; Medium = 1-2; None = 0.
-
-    People too far to judge never change severity.
-    """
+    """High: 3+ in violation, or anyone missing both. Medium: 1-2. None: 0. Too-far workers never count."""
     violations = [v for v in verdicts if v.is_violation]
     if len(violations) >= 3 or any(len(v.missing) == 2 for v in violations):
         return "High"
@@ -65,11 +51,11 @@ def compute_severity(verdicts: list[PersonVerdict]) -> str:
 
 
 def build_payload(verdicts: list[PersonVerdict]) -> dict:
-    """The facts sent to the LLM: counts and per-person statuses. No image, no pixels."""
+    """The facts for the model: counts only. No image, no boxes, nothing per person."""
     counts = count_verdicts(verdicts)
     return {
         "people_detected": counts["people"],
-        # Stated explicitly: without it, Gemini reported all detected people as "checked".
+        # Stated explicitly: without it, the model counted too-far workers as checked.
         "checked_for_ppe": counts["people"] - counts["too_far"],
         "compliant": counts["compliant"],
         "in_violation": counts["violations"],
@@ -78,7 +64,6 @@ def build_payload(verdicts: list[PersonVerdict]) -> dict:
         "missing_vest_only": sum(v.missing == ["vest"] for v in verdicts),
         "missing_helmet_and_vest": sum(len(v.missing) == 2 for v in verdicts),
         "severity": compute_severity(verdicts),
-        "people": [{"id": i, "status": v.status} for i, v in enumerate(verdicts, 1)],
     }
 
 
@@ -87,140 +72,135 @@ def workers(n: int) -> str:
     return f"{n} worker" if n == 1 else f"{n} workers"
 
 
-def template_report(payload: dict) -> tuple[str, str]:
-    """Fallback wording built only from the counts. Returns (summary, recommended_action)."""
-    too_far = payload["too_far_to_judge"]
-    judged = payload["people_detected"] - too_far
-    violations = payload["in_violation"]
+def violation_parts(facts: dict) -> str:
+    """'1 missing a helmet, 2 missing both helmet and vest'."""
+    labels = (
+        ("missing_helmet_only", "missing a helmet"),
+        ("missing_vest_only", "missing a vest"),
+        ("missing_helmet_and_vest", "missing both helmet and vest"),
+    )
+    return ", ".join(f"{facts[key]} {label}" for key, label in labels if facts[key])
 
-    if payload["people_detected"] == 0:
+
+CAMERA_FIX = "move the camera closer or retake the photo so every worker can be checked"
+CAMERA_SENTENCE = "Move the camera closer or retake the photo so every worker can be checked."
+VERIFY = "Verify on site, then correct"  # the check is automated and can be wrong: never "stop work"
+
+
+def missing_items(facts: dict) -> str:
+    """What the flagged workers need, naming only the missing items."""
+    helmet = facts["missing_helmet_only"] or facts["missing_helmet_and_vest"]
+    vest = facts["missing_vest_only"] or facts["missing_helmet_and_vest"]
+    if helmet and vest:
+        return "a helmet and a high-visibility vest"
+    return "a helmet" if helmet else "a high-visibility vest"
+
+
+def pattern(facts: dict, flagged: str = "flagged workers") -> str:
+    """The violation pattern in words, without repeating the counts the reader already sees."""
+    kinds = {
+        "both a helmet and a vest": facts["missing_helmet_and_vest"],
+        "a helmet": facts["missing_helmet_only"],
+        "a vest": facts["missing_vest_only"],
+    }
+    plural = {"both a helmet and a vest": "both helmets and vests", "a helmet": "helmets", "a vest": "vests"}
+    total = sum(kinds.values())
+    kind, n = max(kinds.items(), key=lambda item: item[1])
+    if total == 1:
+        return f"The flagged worker is missing {kind}."
+    if n == total:
+        return f"All {flagged} are missing {plural[kind]}."
+    if 2 * n > total:
+        return f"Most {flagged} are missing {plural[kind]}."
+    return f"The {flagged} are missing a mix of helmets and vests."
+
+
+def distance_note(facts: dict) -> str:
+    """How much of the photo could not be checked, in words."""
+    if 2 * facts["too_far_to_judge"] >= facts["people_detected"]:
+        return "Half or more of the people detected were too far from the camera to check."
+    return "Some workers were too far from the camera to check."
+
+
+def template_report(facts: dict) -> tuple[str, str]:
+    """Fallback wording from the counts, without repeating them. Returns (summary, recommended_action)."""
+    too_far, checked, violations = facts["too_far_to_judge"], facts["checked_for_ppe"], facts["in_violation"]
+
+    if facts["people_detected"] == 0:
         return (
             "No workers were detected in this photo.",
-            "No action needed. If workers should be visible, take a closer or clearer photo.",
+            "No PPE action needed. If workers should be in view, retake the photo closer or from a better angle.",
         )
-
-    if judged == 0:
-        # Nobody could be checked: never say "all compliant" or "no action needed" here.
+    if checked == 0:  # never "all compliant" when nobody was checked
         return (
-            f"{workers(too_far)} detected, but all were too far away to check for a helmet and vest.",
-            "Check these workers in person or take a closer photo.",
+            "No worker could be checked: everyone in the photo was too far from the camera.",
+            CAMERA_SENTENCE,
         )
 
     if violations == 0:
-        summary = "The worker checked was wearing a helmet and a vest." if judged == 1 else (
-            f"All {judged} workers checked were wearing a helmet and a vest."
-        )
-        action = "No action needed for the workers checked."
+        summary = "Every worker who could be checked wears a helmet and a vest."
+        action = CAMERA_SENTENCE if too_far else "No PPE action needed."
     else:
-        parts = []
-        for key, label in (
-            ("missing_helmet_only", "missing a helmet"),
-            ("missing_vest_only", "missing a vest"),
-            ("missing_helmet_and_vest", "missing both a helmet and a vest"),
-        ):
-            if payload[key]:
-                parts.append(f"{payload[key]} {label}")
-        summary = f"{violations} of {workers(judged)} checked not wearing required PPE: {', '.join(parts)}."
-        action = (
-            f"Stop work for the flagged {'worker' if violations == 1 else 'workers'} "
-            "until they wear a helmet and a high-visibility vest, and record the incident."
-        )
-
+        summary = pattern(facts)
+        who = "the flagged worker wears" if violations == 1 else "the flagged workers wear"
+        action = f"{VERIFY}: make sure {who} {missing_items(facts)}"
+        action += f", and {CAMERA_FIX}." if too_far else "."
     if too_far:
-        summary += f" {workers(too_far)} {'was' if too_far == 1 else 'were'} too far away to check."
-        action += f" Check the distant {'worker' if too_far == 1 else 'workers'} in person or with a closer photo."
+        summary += " " + distance_note(facts)
     return summary, action
 
 
-PROMPT = """You write short incident reports for a construction-site safety officer.
-Use ONLY the facts in the JSON below. Do not invent names, locations, causes or numbers.
-The severity is already decided; do not change or question it.
+PROMPT = """You write the short incident summary for a construction-site supervisor. The counts
+are shown right next to your text, so do not repeat them.
 
-Write:
-- summary: 2-3 plain sentences stating how many workers were checked (checked_for_ppe),
-  who is missing what, and how many were too far to check (if any). Workers too far to
-  check were not checked; never call them compliant.
-- recommended_action: 1-2 sentences with a concrete next step for the safety officer.
-  If too_far_to_judge > 0, include checking those workers.
+Rules:
+- 2 or 3 short sentences in total: summary 1 or 2 sentences, recommended_action 1 sentence.
+- Do not restate the counts (people, checked, in violation, too far, or per violation type).
+  Say what stands out, in words: which item is missing most, whether it is one worker or most
+  of them, whether many workers could not be checked.
+- Use only the facts. Do not invent names, places, causes or numbers.
+- No filler or lead-ins such as "it is important to", "please note", "overall", "a total of"
+  or "specifically".
+- Workers in too_far_to_judge were not checked. Never call them compliant.
+- Distance is about the camera, not the workers: the fix is camera placement or photo quality.
+- The check is automated and can be wrong, so never say "stop work". If anyone is in
+  violation, recommended_action starts with "Verify on site, then correct:" and names only the
+  items they are missing. If too_far_to_judge > 0, add the camera fix to the same sentence.
+  If nobody is in violation and nobody is too far, say no PPE action is needed.
+- The severity is already decided; do not mention it.
+
+Example (for 4 in violation, all missing only a helmet, nobody too far):
+  summary: "All flagged workers are missing helmets; their vests were seen."
+  recommended_action: "Verify on site, then correct: make sure the flagged workers wear a helmet."
 
 Facts:
 {facts}
 """
 
 
-def gemini_models() -> list[str]:
-    """Models to try in order. GEMINI_MODEL in .env, if set, is tried first."""
-    preferred = os.environ.get("GEMINI_MODEL")  # empty (GEMINI_MODEL=) counts as not set
-    return [preferred, *DEFAULT_MODELS] if preferred else list(DEFAULT_MODELS)
-
-
-def ask_gemini(payload: dict, model: str, prompt: str = PROMPT, schema: type[BaseModel] = LLMReport) -> BaseModel:
-    """Send the facts to one Gemini model and return its structured answer. Raises on any failure.
-
-    prompt (with a {facts} placeholder) and schema default to the incident report; the digest passes its own.
-    """
-    from google import genai  # imported here so the rest of the module works without it
-    from google.genai import types
-
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set")
-
-    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=LLM_TIMEOUT_MS))
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt.format(facts=json.dumps(payload, indent=2)),
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=schema,
-            temperature=0.2,  # low randomness: reports should read consistently
-        ),
-    )
-    if response.parsed is None:
-        raise ValueError("Gemini returned no parsable report")
-    return response.parsed
-
-
-def ask_llm(payload: dict, prompt: str = PROMPT, schema: type[BaseModel] = LLMReport) -> tuple[BaseModel, str]:
-    """The single place that picks the LLM provider; swap Gemini for Groq here if needed.
-
-    Tries each Gemini model in turn and returns (answer, model). Raises the last error if all fail.
-    """
-    errors = []
-    for model in gemini_models():
-        try:
-            return ask_gemini(payload, model, prompt, schema), model
-        except Exception as exc:
-            errors.append(f"{model}: {type(exc).__name__}: {str(exc)[:300]}")
-            if "GEMINI_API_KEY" in str(exc):
-                break  # no key: other models won't help
-    raise RuntimeError(" | ".join(errors))
-
-
 def generate_report(verdicts: list[PersonVerdict], use_llm: bool = True) -> Report:
-    """Build the incident report. Never raises because of the LLM."""
-    payload = build_payload(verdicts)
-    severity = payload["severity"]
+    """Build the incident report. Never raises because of the model."""
+    facts = build_payload(verdicts)
+    severity = facts["severity"]
 
-    if use_llm:
-        try:
-            answer, model = ask_llm(payload)
-            summary, action = answer.summary.strip(), answer.recommended_action.strip()
-            if not summary or not action:
-                raise ValueError("Gemini returned an empty field")
-            if len(summary) > MAX_FIELD_CHARS or len(action) > MAX_FIELD_CHARS:
-                raise ValueError("Gemini returned an overly long field")
-            return Report(severity, summary, action, source="gemini", model=model)
-        except Exception as exc:  # any LLM problem falls back to the template
-            summary, action = template_report(payload)
-            return Report(severity, summary, action, source="template", error=f"{type(exc).__name__}: {exc}")
-
-    summary, action = template_report(payload)
-    return Report(severity, summary, action, source="template", error="LLM disabled")
+    if not use_llm:
+        summary, action = template_report(facts)
+        return Report(severity, summary, action, source="template", error="LLM disabled")
+    try:
+        result = llm.generate(PROMPT, facts, LLMReport)
+        summary, action = result.value.summary.strip(), result.value.recommended_action.strip()
+        if not summary or not action:
+            raise ValueError("empty field")
+        if len(summary) > MAX_FIELD_CHARS or len(action) > MAX_FIELD_CHARS:
+            raise ValueError("overly long field")
+        return Report(severity, summary, action, source="llm", provider=result.provider, model=result.model)
+    except Exception as exc:  # any model problem: the template
+        summary, action = template_report(facts)
+        return Report(severity, summary, action, source="template", error=f"{type(exc).__name__}: {exc}")
 
 
 def main() -> None:
-    import cv2  # heavy: only the command line needs them
+    import cv2  # heavy imports: only the command line needs them
 
     from src.detect import DEFAULT_CONF, detect
     from src.violations import check_people
@@ -238,12 +218,11 @@ def main() -> None:
     verdicts = check_people(detect(image, conf=args.conf), image_height=image.shape[0])
     report = generate_report(verdicts, use_llm=not args.no_llm)
 
-    print(f"Facts sent to the LLM:\n{json.dumps(build_payload(verdicts), indent=2)}\n")
+    print(f"Facts sent to the model:\n{json.dumps(build_payload(verdicts), indent=2)}\n")
     print(f"Severity: {report.severity}")
     print(f"Summary:  {report.summary}")
     print(f"Action:   {report.recommended_action}")
-    detail = report.model or report.error
-    print(f"Source:   {report.source}" + (f" ({detail})" if detail else ""))
+    print(f"Source:   {report.source} ({report.model or report.error})")  # developer tool: provenance shown
 
 
 if __name__ == "__main__":
