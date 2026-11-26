@@ -15,6 +15,12 @@ import pytest
 
 from src import storage  # importing it reads .env, so both URLs are known below
 
+# Every setting the project reads. A subprocess gets them all present but empty (sealed_env),
+# because load_dotenv() never overrides an existing variable, even an empty one; a missing
+# variable would be filled in from a local .env, which CI doesn't have.
+PROJECT_VARS = ("DATABASE_URL", "DATABASE_URL_TEST", "DATABASE_URL_MAIN", "LLM_API_KEY", "LLM_MODEL",
+                "DISCORD_WEBHOOK_URL", "DISCORD_DIGEST_WEBHOOK_URL", "ALERTS_ENABLED", "RATE_LIMIT_SALT")
+
 TEST_URL = os.environ.get("DATABASE_URL_TEST", "").strip()
 _APP_URL = os.environ.get("DATABASE_URL", "").strip()  # only compared, never used
 TABLES = "analyses, person_verdicts, digest_runs, rate_events"
@@ -38,6 +44,12 @@ def isolate_from_real_services(monkeypatch, request):
     if request.node.get_closest_marker("live") is None:
         for name in ("LLM_API_KEY", "LLM_MODEL"):
             monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def sealed_env() -> dict:
+    """The environment for a test subprocess: no secrets, and nothing from .env. Same on a laptop as in CI."""
+    return {**os.environ, **{name: "" for name in PROJECT_VARS}, "PYTHONIOENCODING": "utf-8"}
 
 
 _cleaned_at_start = False

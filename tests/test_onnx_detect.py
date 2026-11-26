@@ -72,11 +72,12 @@ def test_a_blank_image_has_no_detections():
     assert onnx_detect.detect(np.full((480, 640, 3), 255, dtype=np.uint8)) == []
 
 
-def test_the_deployed_detector_never_imports_torch():
+def test_the_deployed_detector_never_imports_torch(sealed_env):
     script = ("import sys, numpy as np; from src import onnx_detect, pipeline; "
               "onnx_detect.detect(np.zeros((64, 64, 3), dtype=np.uint8)); "
               "print(sorted(m for m in ('torch', 'ultralytics', 'gradio', 'src.detect') if m in sys.modules))")
-    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, cwd=ROOT, timeout=120)
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, cwd=ROOT, timeout=120,
+                         env=sealed_env)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "[]"
 

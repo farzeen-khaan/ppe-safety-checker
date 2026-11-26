@@ -1,0 +1,38 @@
+# CI: the offline test suite on every push and pull request. No secrets are needed or used.
+#
+# Installs what the deployed app installs (requirements.txt: no torch, Ultralytics or Gradio)
+# plus pytest and httpx, so CI also proves the app's dependencies are complete. Tests that need
+# the Neon test branch (DATABASE_URL_TEST), PyTorch and the dataset (the ONNX parity check), or a
+# real API (marker "live") skip themselves, each with its reason in the log.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true  # a newer push makes the older run pointless
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"  # as on Vercel (.python-version)
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install the app's dependencies and the test tools
+        run: pip install -r requirements.txt pytest==9.2.0 httpx==0.28.1
+
+      - name: Run the offline test suite
+        run: python -m pytest -q -m "not live" -rs

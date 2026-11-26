@@ -577,11 +577,6 @@ def get_since(since: datetime, until: datetime | None = None, dsn: str | None = 
     return [_row(r) for r in rows]
 
 
-def get_last_24h(now: datetime | None = None, dsn: str | None = None) -> list[dict]:
-    now = now or now_utc()
-    return get_since(now - timedelta(hours=24), now + timedelta(seconds=1), dsn=dsn)
-
-
 def last_successful_digest_end(dsn: str | None = None) -> datetime | None:
     """Where the next digest starts: the latest window_end of a sent run. Failed and skipped runs don't count."""
     with connect(_ensure_db(dsn)) as conn:
