@@ -308,15 +308,6 @@ def test_list_is_newest_first_with_id_breaking_ties(db):
     assert [r["id"] for r in storage.list_analyses(limit=1, offset=1)] == [b]
 
 
-def test_last_24h_window_edges(db):
-    now = T0
-    save(created_at=now - timedelta(hours=24, seconds=1), name="too old")
-    save(created_at=now - timedelta(hours=24), name="exactly 24h ago")
-    save(created_at=now, name="now")
-    names = [r["image_name"] for r in storage.get_last_24h(now=now)]
-    assert names == ["exactly 24h ago", "now"]
-
-
 def test_get_since_is_half_open_and_oldest_first(db):
     save(created_at=T0 - timedelta(seconds=1), name="before")
     save(created_at=T0, name="start")

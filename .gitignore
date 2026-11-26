@@ -230,6 +230,12 @@ PPE Safety Checker — PRD.md
 # Generated detection outputs
 outputs/
 
-# Local incident log (F5)
+# Old local SQLite log (before Phase 8a; the log is on Neon now)
 db/
 *PRD*.md
+
+# Vercel CLI link and local build output
+.vercel/
+
+# Private notes kept locally (resume bullets, LinkedIn summary)
+career-notes.md
