@@ -7,7 +7,6 @@ Tests that take the `db` fixture use the real log on the Neon test branch instea
 """
 
 import json
-import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -605,19 +604,19 @@ def test_end_to_end_on_the_test_branch(db, monkeypatch, capsys):
 
 # --- A light install ---
 
-def test_running_the_digest_never_imports_the_detection_stack():
+def test_running_the_digest_never_imports_the_detection_stack(sealed_env):
     """GitHub Actions installs requirements-digest.txt only: no torch, OpenCV or Ultralytics."""
     script = "; ".join([
         "import sys",
         "import src.digest as d",
-        "d.get_since = lambda since, until: []",  # no database needed: an empty window
+        "d.get_since = lambda since, until: []",  # no database: an empty window
+        "d.last_successful_digest_end = lambda: None",  # no database: the first-digest window
         "code = d.main(['--dry-run', '--no-llm'])",
         "heavy = sorted(m for m in ('torch', 'ultralytics', 'cv2', 'numpy', 'src.detect', 'src.violations',"
         " 'src.alerts', 'gradio') if m in sys.modules)",
         "print('HEAVY', heavy, 'EXIT', code)",
     ])
-    env = {k: v for k, v in os.environ.items() if k != "DATABASE_URL"} | {"PYTHONIOENCODING": "utf-8"}
-    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env,
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=sealed_env,
                             cwd=Path(__file__).resolve().parent.parent, timeout=120, encoding="utf-8")
     assert result.returncode == 0, result.stderr
     assert "HEAVY [] EXIT 0" in result.stdout
